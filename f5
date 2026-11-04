@@ -3441,11 +3441,15 @@ local function ScanVotePads()
                     end
 
                     if padPart then
-                        -- Смещение в самую нижнюю область 3D-зоны Pad (чуть ниже уровня пола) в лежачем положении
+                        -- Смещение в самую нижнюю область 3D-зоны Pad (чуть ниже уровня пола) в лежачем положении (-90 градусов по X)
                         local halfHeight = (padPart.Size.Y > 1) and (padPart.Size.Y * 0.5) or 2.5
                         local targetPos = padPart.Position - Vector3.new(0, halfHeight - 0.7, 0)
-                        local lieRotation = CFrame.Angles(math.rad(-90), 0, 0)
-                        currentMaps[mapName] = CFrame.new(targetPos) * (padPart.CFrame - padPart.Position) * lieRotation
+                        local padLook = padPart.CFrame.LookVector
+                        local flatLook = Vector3.new(padLook.X, 0, padLook.Z)
+                        local baseCFrame = (flatLook.Magnitude > 0.01)
+                            and CFrame.new(targetPos, targetPos + flatLook)
+                            or CFrame.new(targetPos)
+                        currentMaps[mapName] = baseCFrame * CFrame.Angles(math.rad(-90), 0, 0)
                     end
                 end
             end
@@ -3610,6 +3614,10 @@ task.spawn(function()
                     currentHum.PlatformStand = true
                     currentHrp.AssemblyLinearVelocity = Vector3.zero
                     currentHrp.AssemblyAngularVelocity = Vector3.zero
+                    local holdG = currentHrp:FindFirstChild("VoteGyro") :: BodyGyro?
+                    if holdG then
+                        holdG.CFrame = bestCFrame
+                    end
                 else
                     break
                 end
