@@ -1841,10 +1841,10 @@ local function PreRoundKillChain()
 end
 
 -- =====================================================================
--- ДОБИВАНИЕ ОСТАВШЕЙСЯ ЦЕЛИ ПРИ ПОЛНОЙ СУМКЕ (KILL ALL)
+-- ДОБИВАНИЕ ОСТАВШИХСЯ ЦЕЛЕЙ ПРИ ПОЛНОЙ СУМКЕ (KILL ALL)
 -- =====================================================================
 local function KillFinalTarget()
-    UpdateStatus("Сумка полна: Добивание финальной цели...", Color3.fromRGB(255, 80, 80))
+    UpdateStatus("Сумка полна: Kill All — зачистка всех игроков...", Color3.fromRGB(255, 80, 80))
     local knife = InspectAndEquipKnife()
     if not knife then
         UpdateStatus("Kill All: Нож не найден в инвентаре!", Color3.fromRGB(255, 100, 100))
@@ -1852,21 +1852,38 @@ local function KillFinalTarget()
     end
 
     local killStart = tick()
-    while tick() - killStart < 4 and not IsTerminated and RoundInProgress() do
+    while tick() - killStart < 15 and not IsTerminated and RoundInProgress() do
         local target = RunTargetScan() or FindRemainingAlivePlayer()
         if not target then break end
 
+        -- В режиме с твинком твинка не трогаем даже при Kill All
+        if SETTINGS.GameMode == "Twin" and IsTwinPlayer(target, target.Name) then
+            local count = CountAliveRoundPlayers()
+            if count <= 2 then
+                -- Остались только мы и твинк
+                break
+            end
+        end
+
         local tChar = target.Character
         local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
-        if not tHum or tHum.Health <= 0 then break end
+        if not tHum or tHum.Health <= 0 then
+            task.wait(0.05)
+            continue
+        end
 
         knife = InspectAndEquipKnife() or knife
         TurboKill(target, knife)
-        task.wait(0.05)
+        task.wait(0.08)
+
+        local remaining = CountAliveRoundPlayers()
+        if remaining <= 1 or (SETTINGS.GameMode == "Twin" and remaining <= 2 and IsTwinPlayer(target, target.Name)) then
+            break
+        end
     end
 
     UnequipKnife()
-    UpdateStatus("Kill All: Раунд выигран! Победа.", Color3.fromRGB(100, 255, 120))
+    UpdateStatus("Kill All: Зачистка завершена. Ожидание завершения раунда...", Color3.fromRGB(100, 255, 120))
 end
 
 -- =====================================================================
@@ -3288,20 +3305,60 @@ local function ActionState()
 
     if not SETTINGS.AutoFarmEnabled or IsTerminated then return end
 
+    local function maintainHoverUntilRoundEnd()
+        local char = rt:Character()
+        local hrp = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart") :: BasePart?)
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum then return end
+
+        hum.PlatformStand = true
+
+        local hoverV = hrp:FindFirstChild("FarmVelocity") or Instance.new("BodyVelocity")
+        hoverV.Name = "FarmVelocity"
+        hoverV.Velocity = Vector3.zero
+        hoverV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+        hoverV.Parent = hrp
+
+        local hoverG = hrp:FindFirstChild("FarmGyro") or Instance.new("BodyGyro")
+        hoverG.Name = "FarmGyro"
+        hoverG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+        hoverG.CFrame = hrp.CFrame
+        hoverG.P = 3000
+        hoverG.Parent = hrp
+
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+
+        -- Удерживаем персонажа в воздухе на текущей точке до конца раунда
+        while not IsTerminated and RoundInProgress() and SETTINGS.AutoFarmEnabled and hum.Health > 0 do
+            hum.PlatformStand = true
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+            task.wait(0.2)
+        end
+
+        if hoverV and hoverV.Parent then hoverV:Destroy() end
+        if hoverG and hoverG.Parent then hoverG:Destroy() end
+        if hum then hum.PlatformStand = false end
+    end
+
     -- 3. Действия при наполнении сумки или завершении раунда
     if BagIsFull then
         if SETTINGS.BagFullMode == "KillAll" then
-            -- Режим Kill All: достаём нож и через TurboKill добиваем оставшуюся цель, забирая победу
+            -- Режим Kill All: добиваем всех оставшихся соперников
             KillFinalTarget()
-            task.wait(0.5)
+            task.wait(0.3)
             BagIsFull = false
             ChangeState(State.WaitingForRoundEnd)
+            -- Остаемся парить на месте до завершения раунда, чтобы не упасть в бездну
+            maintainHoverUntilRoundEnd()
         elseif SETTINGS.BagFullMode == "AFK" then
-            -- Режим AFK: не делаем ресет и не убиваем игроков, просто ничего не делаем и ждём окончания раунда
+            -- Режим AFK: не делаем ресет и не убиваем игроков, остаемся парить на месте
             UnequipKnife()
-            UpdateStatus("Сумка полна: AFK (ожидание)", Color3.fromRGB(170, 130, 255))
+            UpdateStatus("Сумка полна: AFK (парение на месте)", Color3.fromRGB(170, 130, 255))
             BagIsFull = false
             ChangeState(State.WaitingForRoundEnd)
+            maintainHoverUntilRoundEnd()
         else
             -- Режим Reset: делаем сброс персонажа (BreakJoints). В живых остаётся только твинк/соперник
             UpdateStatus("Сумка полна: Сброс персонажа", Color3.fromRGB(200, 200, 200))
