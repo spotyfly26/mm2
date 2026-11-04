@@ -255,6 +255,8 @@ local function ChangeState(newState: string)
     if newState == State.WaitingForRound then
         BagCoinCount = 0
         ActiveCurrencyName = "—"
+        table.clear(PlayerAliveCache)
+        table.clear(PlayerRolesCache)
     end
     if newState == State.WaitingForRound and RejoinPending and not isTeleporting and SETTINGS.AutoRejoinEnabled then
         task.defer(function()
@@ -697,6 +699,8 @@ local function SetupRemoteHooks()
     if roundStart then
         RegisterConnection(roundStart.OnClientEvent:Connect(function(_, playersData)
             if IsTerminated then return end
+            table.clear(PlayerAliveCache)
+            table.clear(PlayerRolesCache)
             DoForceCheckMap()
             if typeof(playersData) == "table" then
                 for pName, pInfo in pairs(playersData) do
@@ -733,7 +737,7 @@ local function SetupRemoteHooks()
                     if pInfo.Role ~= nil then PlayerRolesCache[sName] = tostring(pInfo.Role) end
                 end
             end
-            if count == 0 then
+            if count == 0 and CurrentState ~= State.Action then
                 table.clear(PlayerAliveCache)
                 table.clear(PlayerRolesCache)
             end
@@ -888,6 +892,8 @@ local function SetupInitialScreensBypass()
 end
 SetupInitialScreensBypass()
 
+local cachedCleanTwin = string.lower(string.gsub(SETTINGS.TwinName or "", "^%s*(.-)%s*$", "%1"))
+
 local function GetNearestCoin(): Instance?
     local char = rt:Character()
     if not char or not char.PrimaryPart then return nil end
@@ -898,12 +904,10 @@ local function GetNearestCoin(): Instance?
     local twinPos: Vector3? = nil
     local twinPredPos: Vector3? = nil
     local twinPlr: Player? = nil
-    local twinName = SETTINGS.TwinName
 
-    if SETTINGS.TwinAvoidEnabled and twinName and twinName ~= "" then
-        local cleanTwin = string.lower(string.gsub(twinName, "^%s*(.-)%s*$", "%1"))
+    if SETTINGS.TwinAvoidEnabled and cachedCleanTwin ~= "" then
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and string.lower(plr.Name) == cleanTwin then
+            if plr ~= LocalPlayer and string.lower(plr.Name) == cachedCleanTwin then
                 if IsPlayerActuallyAlive(plr) then
                     local tChar = plr.Character
                     local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild("HumanoidRootPart") or tChar:FindFirstChildWhichIsA("BasePart"))
@@ -931,7 +935,7 @@ local function GetNearestCoin(): Instance?
     local avoidRadius = SETTINGS.TwinAvoidRadius or 30
 
     for coin, _ in pairs(rt.cachedCoins) do
-        if coin and rt.coinContainer and coin.Parent == rt.coinContainer and not isCoinTouched(coin) and coin:FindFirstChildWhichIsA("TouchTransmitter") then
+        if coin and coin.Parent and not isCoinTouched(coin) and coin:FindFirstChildWhichIsA("TouchTransmitter") then
             local coinPos = coin.Position
             local myDist = (coinPos - myPos).Magnitude
 
@@ -2577,7 +2581,8 @@ BindClick(SaveTwinBtn, function()
     local name = TwinTextBox.Text or ""
     name = string.gsub(name, "^%s*(.-)%s*$", "%1")
     SETTINGS.TwinName = name
-    local ok = SaveProfile(StatsPanel and StatsPanel.Visible)
+    cachedCleanTwin = string.lower(name)
+    local ok = SaveProfile(StatsPanel and StatsPanel.Visible, RejoinPanel and RejoinPanel.Visible)
     if ok then
         UpdateStatus("Твинк сохранен в profile: " .. (name ~= "" and name or "(пусто)"), Color3.fromRGB(100, 255, 100))
     else
@@ -2587,7 +2592,9 @@ end)
 
 TwinTextBox.FocusLost:Connect(function()
     local name = TwinTextBox.Text or ""
-    SETTINGS.TwinName = string.gsub(name, "^%s*(.-)%s*$", "%1")
+    local clean = string.gsub(name, "^%s*(.-)%s*$", "%1")
+    SETTINGS.TwinName = clean
+    cachedCleanTwin = string.lower(clean)
 end)
 
 -- Переключение режима: С ТВИНКОМ / СОЛО
@@ -2839,9 +2846,9 @@ RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, t
     end)
 end))
 
--- Отслеживание системных ошибок, дисконнектов и окон кика через GuiService
+-- Отслеживание системных ошибок, дисконнектов и окон кика через GuiService (работает всегда)
 RegisterConnection(GuiService.ErrorMessageChanged:Connect(function(msg)
-    if IsTerminated or not SETTINGS.AutoRejoinEnabled or isTeleporting then return end
+    if IsTerminated or isTeleporting then return end
     if typeof(msg) == "string" and msg ~= "" then
         warn("[AutoRejoin] Обнаружен дисконнект / ошибка GuiService: " .. msg)
         UpdateStatus("Сбой сети/кик! Срочный реконнект...", Color3.fromRGB(255, 80, 80))
@@ -3003,7 +3010,7 @@ task.spawn(function()
         if SETTINGS.PotatoMode then
             setTargetFps(SETTINGS.FpsCap)
         end
-        task.wait(1.5)
+        task.wait(40)
     end
 end)
 
@@ -3426,8 +3433,8 @@ local function ScanVotePads()
                     table.insert(allNames, mapName)
                     local tpPart = pad:IsA("BasePart") and pad or (pad:IsA("Model") and (pad.PrimaryPart or pad:FindFirstChildWhichIsA("BasePart"))) or pad:FindFirstChildWhichIsA("BasePart")
                     if tpPart then
-                        -- Идеальная высота (1.0 студ над центром Pad, Y = 466.5)
-                        currentMaps[mapName] = tpPart.CFrame + Vector3.new(0, 1.0, 0)
+                        -- Высота под полом но еще в области голосования
+                        currentMaps[mapName] = tpPart.CFrame + Vector3.new(0, -1.2, 0)
                     end
                 end
             end
@@ -3637,6 +3644,9 @@ local function TerminateScript()
                 
                 local bg = hrp:FindFirstChild("FarmGyro")
                 if bg then bg:Destroy() end
+
+                local vh = hrp:FindFirstChild("VoteHover")
+                if vh then vh:Destroy() end
                 
                 hrp.AssemblyLinearVelocity = Vector3.zero
                 hrp.AssemblyAngularVelocity = Vector3.zero
