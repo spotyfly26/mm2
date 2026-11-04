@@ -51,42 +51,6 @@ pcall(function()
     end
 end)
 
--- === АВТОМАТИЧЕСКАЯ ОЧЕРЕДЬ ПРИ ТЕЛЕПОРТАЦИИ (QUEUE_ON_TELEPORT) ===
--- Если вы делитесь raw-ссылкой (GitHub/Pastebin), вставьте её сюда:
-local SCRIPT_RAW_URL = ""
-
-local function QueueScriptForTeleport()
-    local qot = queue_on_teleport 
-        or (syn and syn.queue_on_teleport) 
-        or (fluxus and fluxus.queue_on_teleport)
-
-    if typeof(qot) == "function" then
-        pcall(function()
-            local payload = string.format([=[
-                pcall(function()
-                    local url = %q
-                    if url ~= "" then
-                        loadstring(game:HttpGet(url))()
-                    else
-                        local rf = readfile or (syn and syn.readfile)
-                        local isf = isfile or (syn and syn.isfile)
-                        if typeof(isf) == "function" and typeof(rf) == "function" then
-                            local searchFiles = {"20gm.lua", "scripts/20gm.lua", "autoexecute/20gm.lua"}
-                            for _, f in ipairs(searchFiles) do
-                                if isf(f) then
-                                    loadstring(rf(f))()
-                                    break
-                                end
-                            end
-                        end
-                    end
-                end)
-            ]=], SCRIPT_RAW_URL)
-            qot(payload)
-        end)
-    end
-end
-
 local HttpService = game:GetService("HttpService")
 
 -- === СОХРАНЕНИЕ / ЗАГРУЗКА ПРОФИЛЯ ===
@@ -1234,6 +1198,7 @@ local EVENT_TOKENS_CONFIG = {
 
 local cachedTokensLabel: TextLabel? = nil
 local tokensChangedConn: RBXScriptConnection? = nil
+local tokensAncestryConn: RBXScriptConnection? = nil
 
 local function FindInventoryTokensLabel(): TextLabel?
     local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
@@ -1295,6 +1260,10 @@ local function HookInventoryTokensLabel(lbl: TextLabel)
         tokensChangedConn:Disconnect()
         tokensChangedConn = nil
     end
+    if tokensAncestryConn then
+        tokensAncestryConn:Disconnect()
+        tokensAncestryConn = nil
+    end
 
     cachedTokensLabel = lbl
     TotalInventoryTokens = lbl.Text
@@ -1311,28 +1280,24 @@ local function HookInventoryTokensLabel(lbl: TextLabel)
     end)
     RegisterConnection(tokensChangedConn)
 
-    local ancConn: RBXScriptConnection? = nil
-    ancConn = lbl.AncestryChanged:Connect(function(_, parent)
+    tokensAncestryConn = lbl.AncestryChanged:Connect(function(_, parent)
         if not parent or not lbl:IsDescendantOf(game) then
             if tokensChangedConn then
                 tokensChangedConn:Disconnect()
                 tokensChangedConn = nil
             end
-            if ancConn then
-                ancConn:Disconnect()
-                ancConn = nil
+            if tokensAncestryConn then
+                tokensAncestryConn:Disconnect()
+                tokensAncestryConn = nil
             end
             cachedTokensLabel = nil
         end
     end)
-    if ancConn then RegisterConnection(ancConn) end
+    if tokensAncestryConn then RegisterConnection(tokensAncestryConn) end
 end
 
 local function SetupInventoryTokensWatcher()
     task.spawn(function()
-        local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 15)
-        if not pGui then return end
-
         local function tryHook(): boolean
             if cachedTokensLabel and cachedTokensLabel.Parent and cachedTokensLabel:IsDescendantOf(game) then
                 return true
@@ -1345,39 +1310,18 @@ local function SetupInventoryTokensWatcher()
             return false
         end
 
+        -- Первая попытка при старте
         tryHook()
 
-        -- Слушаем появление ScreenGui CrossPlatform
-        RegisterConnection(pGui.ChildAdded:Connect(function(child)
-            if child.Name == EVENT_TOKENS_CONFIG.ScreenGui then
-                task.wait(0.5)
+        -- Спокойный опрос раз в 5 секунд:
+        -- 1. Если ссылка уже есть и жива — моментально пропускает (0% CPU).
+        -- 2. Если лейбл удалили/пересоздали (смена раунда) — тихо находит новую ссылку и вешает реактивный сигнал.
+        while not IsTerminated do
+            task.wait(5)
+            if not cachedTokensLabel or not cachedTokensLabel.Parent or not cachedTokensLabel:IsDescendantOf(game) then
                 tryHook()
-                RegisterConnection(child.DescendantAdded:Connect(function(desc)
-                    if desc:IsA("TextLabel") and (desc.Name == "TextLabel" or (desc.Parent and desc.Parent.Name == "Container")) then
-                        tryHook()
-                    end
-                end))
             end
-        end))
-
-        local cp = pGui:FindFirstChild(EVENT_TOKENS_CONFIG.ScreenGui) or pGui:FindFirstChild(EVENT_TOKENS_CONFIG.ScreenGui, true)
-        if cp then
-            RegisterConnection(cp.DescendantAdded:Connect(function(desc)
-                if desc:IsA("TextLabel") and (desc.Name == "TextLabel" or (desc.Parent and desc.Parent.Name == "Container")) then
-                    tryHook()
-                end
-            end))
         end
-
-        -- Легковесный watchdog: просыпается раз в 5 секунд ТОЛЬКО пока лейбл не найден
-        task.spawn(function()
-            while not IsTerminated do
-                if not cachedTokensLabel or not cachedTokensLabel.Parent then
-                    tryHook()
-                end
-                task.wait(5)
-            end
-        end)
     end)
 end
 
@@ -2816,8 +2760,6 @@ DoRejoin = function(reason: string?)
     local targetReason = reason or "Таймер"
     print(string.format("[AutoRejoin] Запуск реконнекта (%s)...", targetReason))
     UpdateStatus("Реконнект (" .. targetReason .. ")...", Color3.fromRGB(255, 200, 100))
-    
-    QueueScriptForTeleport()
 
     pcall(function()
         GuiService:ClearError()
@@ -2857,7 +2799,6 @@ RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, t
     pcall(function()
         GuiService:ClearError()
     end)
-    QueueScriptForTeleport()
     pcall(function()
         TeleportService:Teleport(game.PlaceId, LocalPlayer)
     end)
@@ -3741,6 +3682,16 @@ local function TerminateScript()
     table.clear(rt.potatoConnections)
     
     AutoFarmCleanUp()
+
+    if tokensChangedConn then
+        pcall(function() tokensChangedConn:Disconnect() end)
+        tokensChangedConn = nil
+    end
+    if tokensAncestryConn then
+        pcall(function() tokensAncestryConn:Disconnect() end)
+        tokensAncestryConn = nil
+    end
+    cachedTokensLabel = nil
     
     pcall(function()
         local char = LocalPlayer.Character
