@@ -145,7 +145,7 @@ local SETTINGS = {
     AutoRejoinEnabled = (initialProfile and initialProfile.AutoRejoinEnabled == true) or false,
     RejoinTime = (initialProfile and typeof(initialProfile.RejoinTime) == "number" and initialProfile.RejoinTime > 0 and initialProfile.RejoinTime) or 5400,
     RejoinServerMode = (initialProfile and (initialProfile.RejoinServerMode == "Same" or initialProfile.RejoinServerMode == "Random") and initialProfile.RejoinServerMode) or "Same",
-    ScaleIndex = (initialProfile and typeof(initialProfile.ScaleIndex) == "number" and initialProfile.ScaleIndex >= 1 and initialProfile.ScaleIndex <= 3 and initialProfile.ScaleIndex) or 1
+    ScaleIndex = (initialProfile and typeof(initialProfile.ScaleIndex) == "number" and initialProfile.ScaleIndex >= 1 and initialProfile.ScaleIndex <= 4 and initialProfile.ScaleIndex) or 1
 }
 
 local function SaveProfile(statsVisible: boolean?, rejoinVisible: boolean?): boolean
@@ -1923,19 +1923,48 @@ TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.TextSize = 14
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 
+local function GetScreenAutoOptimalScale(): number
+    local cam = Workspace.CurrentCamera
+    local viewport = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    local height = viewport.Y
+    if height <= 0 then height = 1080 end
+    
+    if height < 600 then
+        return UI_SCALE * 1.0  -- 0.5 (смартфоны / маленькие экраны)
+    elseif height < 900 then
+        return UI_SCALE * 1.4  -- 0.7 (ноутбуки / средние экраны)
+    else
+        return UI_SCALE * 1.8  -- 0.9 (Full HD 1080p / 2K мониторы)
+    end
+end
+
 local scaleSteps = {
-    { text = "1x", scale = UI_SCALE * 1.0, color = Color3.fromRGB(50, 50, 65) },
-    { text = "1.5x", scale = UI_SCALE * 1.5, color = Color3.fromRGB(40, 90, 180) },
-    { text = "2x", scale = UI_SCALE * 2.0, color = Color3.fromRGB(45, 125, 245) }
+    { text = "Auto", scale = nil, isAuto = true, color = Color3.fromRGB(110, 60, 180) },
+    { text = "1x", scale = UI_SCALE * 1.0, isAuto = false, color = Color3.fromRGB(50, 50, 65) },
+    { text = "1.5x", scale = UI_SCALE * 1.5, isAuto = false, color = Color3.fromRGB(40, 90, 180) },
+    { text = "2x", scale = UI_SCALE * 2.0, isAuto = false, color = Color3.fromRGB(45, 125, 245) }
 }
 local scaleIndex = SETTINGS.ScaleIndex or 1
 local initialScaleStep = scaleSteps[scaleIndex] or scaleSteps[1]
-MainScale.Scale = initialScaleStep.scale
+
+local function ApplyCurrentScale(recenter: boolean?)
+    local current = scaleSteps[scaleIndex] or scaleSteps[1]
+    if current.isAuto then
+        MainScale.Scale = GetScreenAutoOptimalScale()
+    else
+        MainScale.Scale = current.scale or (UI_SCALE * 1.0)
+    end
+    if recenter then
+        MainFrame.Position = UDim2.new(0.5, 0, 0.55, 0)
+    end
+end
+
+ApplyCurrentScale(false)
 
 local ScaleBtn = Instance.new("TextButton", TitleBar)
 ScaleBtn.Name = "ScaleBtn"
-ScaleBtn.Size = UDim2.new(0, 28, 0, 26)
-ScaleBtn.Position = UDim2.new(1, -92, 0.5, -13)
+ScaleBtn.Size = UDim2.new(0, 32, 0, 26)
+ScaleBtn.Position = UDim2.new(1, -96, 0.5, -13)
 ScaleBtn.BackgroundColor3 = initialScaleStep.color
 ScaleBtn.Text = initialScaleStep.text
 ScaleBtn.TextColor3 = Color3.new(1, 1, 1)
@@ -1950,13 +1979,19 @@ BindClick(ScaleBtn, function()
     SETTINGS.ScaleIndex = scaleIndex
     local current = scaleSteps[scaleIndex]
     
-    MainScale.Scale = current.scale
+    ApplyCurrentScale(true)
     ScaleBtn.Text = current.text
     ScaleBtn.BackgroundColor3 = current.color
-    
-    -- Перемещаем шапку скрипта в центр верхней трети экрана, чтобы окно всегда оставалось в видимой зоне
-    MainFrame.Position = UDim2.new(0.5, 0, 0.55, 0)
 end)
+
+-- Динамическое обновление масштаба при изменении разрешения окна (если включен режим Auto)
+if Workspace.CurrentCamera then
+    RegisterConnection(Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        if scaleSteps[scaleIndex] and scaleSteps[scaleIndex].isAuto then
+            ApplyCurrentScale(false)
+        end
+    end))
+end
 
 local TPBtn = Instance.new("TextButton", TitleBar)
 TPBtn.Name = "TPBtn"
