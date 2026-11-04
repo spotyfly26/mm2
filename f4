@@ -3431,10 +3431,21 @@ local function ScanVotePads()
 
                 if mapName and mapName ~= "" then
                     table.insert(allNames, mapName)
-                    local tpPart = pad:IsA("BasePart") and pad or (pad:IsA("Model") and (pad.PrimaryPart or pad:FindFirstChildWhichIsA("BasePart"))) or pad:FindFirstChildWhichIsA("BasePart")
-                    if tpPart then
-                        -- Высота под полом но еще в области голосования
-                        currentMaps[mapName] = tpPart.CFrame + Vector3.new(0, -1.2, 0)
+                    local padPart: BasePart? = nil
+                    if pad:IsA("BasePart") and pad.Name == "Pad" then
+                        padPart = pad
+                    elseif pad:IsA("Model") then
+                        padPart = (pad:FindFirstChild("Pad") or pad:FindFirstChild("Pad", true) or pad.PrimaryPart or pad:FindFirstChildWhichIsA("BasePart")) :: BasePart?
+                    elseif pad:IsA("BasePart") then
+                        padPart = pad
+                    end
+
+                    if padPart then
+                        -- Смещение в самую нижнюю область 3D-зоны Pad (чуть ниже уровня пола) в лежачем положении
+                        local halfHeight = (padPart.Size.Y > 1) and (padPart.Size.Y * 0.5) or 2.5
+                        local targetPos = padPart.Position - Vector3.new(0, halfHeight - 0.7, 0)
+                        local lieRotation = CFrame.Angles(math.rad(-90), 0, 0)
+                        currentMaps[mapName] = CFrame.new(targetPos) * (padPart.CFrame - padPart.Position) * lieRotation
                     end
                 end
             end
@@ -3541,12 +3552,21 @@ task.spawn(function()
                     if part and part.Parent then part.CanCollide = false end
                 end
 
-                -- Зависаем в воздухе без падения (BodyVelocity вместо Anchored)
-                local holdV = Instance.new("BodyVelocity")
+                if currentHum then currentHum.PlatformStand = true end
+
+                -- Зависаем в воздухе без падения (BodyVelocity + BodyGyro)
+                local holdV = currentHrp:FindFirstChild("VoteHover") or Instance.new("BodyVelocity")
                 holdV.Name = "VoteHover"
                 holdV.Velocity = Vector3.zero
-                holdV.MaxForce = Vector3.new(0, 9e9, 0)
+                holdV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
                 holdV.Parent = currentHrp
+
+                local holdG = currentHrp:FindFirstChild("VoteGyro") or Instance.new("BodyGyro")
+                holdG.Name = "VoteGyro"
+                holdG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+                holdG.CFrame = bestCFrame
+                holdG.P = 3000
+                holdG.Parent = currentHrp
 
                 currentHrp.AssemblyLinearVelocity = Vector3.zero
                 currentHrp.AssemblyAngularVelocity = Vector3.zero
@@ -3558,12 +3578,14 @@ task.spawn(function()
                 -- Пауза для фиксации пакета координат сервером MM2
                 task.wait(0.15)
 
-                if holdV and holdV.Parent then holdV:Destroy() end
-
-                -- Если спам выключен или лимит достигнут — выходим сразу БЕЗ сброса
+                -- Если спам выключен или лимит достигнут — выходим сразу БЕЗ сброса (остаемся парить под полом)
                 if not SETTINGS.VoteSpamEnabled or voteCount >= maxVotes or rt:CheckIfGameInProgress() or not SETTINGS.AutoVoteEnabled then
                     break
                 end
+
+                -- Для следующей итерации спама удаляем ховер и сбрасываем персонажа
+                if holdV and holdV.Parent then holdV:Destroy() end
+                if holdG and holdG.Parent then holdG:Destroy() end
 
                 -- Сброс персонажа для получения следующего голоса
                 pcall(function()
@@ -3579,8 +3601,34 @@ task.spawn(function()
                 -- поэтому телепорт произойдет мгновенно в 0-й миллисекунде появления!
             end
 
-            isVotingNoclip = false
             HasVoted = true
+            UpdateStatus(string.format("Голос: Отдан (%d за %s). Ожидание раунда...", voteCount, bestMap), Color3.fromRGB(100, 255, 100))
+
+            -- Остаемся парить в нижней области стенда под полом в noclip до старта раунда
+            while not IsTerminated and SETTINGS.AutoVoteEnabled and not rt:CheckIfGameInProgress() do
+                if currentChar and currentHrp and currentHum and currentHum.Health > 0 then
+                    currentHum.PlatformStand = true
+                    currentHrp.AssemblyLinearVelocity = Vector3.zero
+                    currentHrp.AssemblyAngularVelocity = Vector3.zero
+                else
+                    break
+                end
+                task.wait(0.25)
+            end
+
+            -- Раунд начался или скрипт/голос отключен — плавно выключаем ховер и ноклип
+            isVotingNoclip = false
+            if currentHrp then
+                local vh = currentHrp:FindFirstChild("VoteHover")
+                if vh then vh:Destroy() end
+                local vg = currentHrp:FindFirstChild("VoteGyro")
+                if vg then vg:Destroy() end
+                currentHrp.AssemblyLinearVelocity = Vector3.zero
+                currentHrp.AssemblyAngularVelocity = Vector3.zero
+            end
+            if currentHum then
+                currentHum.PlatformStand = false
+            end
             UpdateStatus(string.format("Голос: Завершено (%d за %s)", voteCount, bestMap), Color3.fromRGB(100, 255, 100))
         end
     end
@@ -3605,6 +3653,7 @@ local function TerminateScript()
     SETTINGS.AutoRejoinEnabled = false
     RejoinPending = false
     Working = false
+    isVotingNoclip = false
     UnequipKnife()
     
     for _, conn in ipairs(ActiveConnections) do
@@ -3647,6 +3696,9 @@ local function TerminateScript()
 
                 local vh = hrp:FindFirstChild("VoteHover")
                 if vh then vh:Destroy() end
+
+                local vg = hrp:FindFirstChild("VoteGyro")
+                if vg then vg:Destroy() end
                 
                 hrp.AssemblyLinearVelocity = Vector3.zero
                 hrp.AssemblyAngularVelocity = Vector3.zero
