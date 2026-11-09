@@ -105,7 +105,7 @@ local SETTINGS = {
     TwinAvoidEnabled = true, -- Умное разделение зон фарма с твинком (без гонок за одной монетой)
     TwinAvoidRadius = 30, -- Компактная сфера влияния твинка (студы)
     UnderfloorOffset = 3.8, -- Смещение под карту (студы ниже монеты)
-    SafeUnderfloorY = 50, -- Безопасная глубина сейф-зоны до спавна монет
+    SafeUnderfloorY =120, -- Безопасная глубина сейф-зоны до спавна монет
     AutoRejoinEnabled = (initialProfile and initialProfile.AutoRejoinEnabled == true) or false,
     RejoinTime = (initialProfile and typeof(initialProfile.RejoinTime) == "number" and initialProfile.RejoinTime > 0 and initialProfile.RejoinTime) or 5400,
     RejoinServerMode = (initialProfile and (initialProfile.RejoinServerMode == "Same" or initialProfile.RejoinServerMode == "Random") and initialProfile.RejoinServerMode) or "Same",
