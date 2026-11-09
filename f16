@@ -3566,7 +3566,10 @@ local function ScanVotePads()
                         local baseCFrame = (flatLook.Magnitude > 0.01)
                             and CFrame.new(targetPos, targetPos + flatLook)
                             or CFrame.new(targetPos)
-                        currentMaps[mapName] = baseCFrame * CFrame.Angles(math.rad(-90), 0, 0)
+                        currentMaps[mapName] = {
+                            cframe = baseCFrame * CFrame.Angles(math.rad(-90), 0, 0),
+                            part = padPart
+                        }
                     end
                 end
             end
@@ -3634,53 +3637,86 @@ task.spawn(function()
         for name, _ in pairs(availableMaps) do table.insert(mapNames, name) end
         if #mapNames < 2 then continue end
 
-        local bestMap, bestPriority, bestCFrame = nil, 999, nil
-        for name, tpCFrame in pairs(availableMaps) do
+        local bestMap, bestPriority, bestCFrame, bestPadPart = nil, 999, nil, nil
+        for name, data in pairs(availableMaps) do
             local priority = GetMapPriority(name)
             if priority < bestPriority then
                 bestPriority = priority
                 bestMap = name
-                bestCFrame = tpCFrame
+                bestCFrame = data.cframe
+                bestPadPart = data.part
             end
         end
 
         if bestMap and bestPriority < 999 and bestCFrame then
-            local maxVotes = SETTINGS.VoteSpamEnabled and 50 or 1
-            UpdateStatus(string.format("Голос: Старт (%s, %s)", bestMap, SETTINGS.VoteSpamEnabled and "спам до 11" or "1 голос"), Color3.fromRGB(50, 255, 255))
+            local maxVotes = SETTINGS.VoteSpamEnabled and 30 or 1
+            UpdateStatus(string.format("Голос: Старт (%s, %s)", bestMap, SETTINGS.VoteSpamEnabled and "макс. спам" or "1 голос"), Color3.fromRGB(50, 255, 255))
 
             local voteCount = 0
             isVotingNoclip = true
 
-            local currentChar = LocalPlayer.Character
-            local currentHrp = currentChar and (currentChar:FindFirstChild("HumanoidRootPart") or currentChar.PrimaryPart) :: BasePart?
-            local currentHum = currentChar and currentChar:FindFirstChildOfClass("Humanoid")
+            local currentChar = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+            local currentHrp = (currentChar:WaitForChild("HumanoidRootPart", 3) or currentChar.PrimaryPart) :: BasePart?
+            local currentHum = currentChar:FindFirstChildOfClass("Humanoid")
+
+            local touchFn = firetouchinterest or firetouchtransmitter or (syn and syn.firetouchinterest)
 
             while voteCount < maxVotes and not IsTerminated and SETTINGS.AutoVoteEnabled do
                 if rt:CheckIfGameInProgress() then break end
 
-                -- Берём актуального персонажа без блокирующего ожидания
-                local char = LocalPlayer.Character or currentChar
-                if not char then
-                    char = LocalPlayer.CharacterAdded:Wait()
-                end
-                currentChar = char
-                currentHrp = (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart) :: BasePart?
-                currentHum = char:FindFirstChildOfClass("Humanoid")
-
-                if not currentHrp then
-                    task.wait(0.05)
-                    continue
+                if not currentChar or not currentHrp or not currentHum or currentHum.Health <= 0 then
+                    currentChar = LocalPlayer.CharacterAdded:Wait()
+                    currentHrp = (currentChar:WaitForChild("HumanoidRootPart", 3) or currentChar.PrimaryPart) :: BasePart?
+                    currentHum = currentChar:FindFirstChildOfClass("Humanoid")
                 end
 
-                -- Мгновенно отключаем коллизию
-                updateBodyPartsCache()
-                for _, part in ipairs(rt.cachedBodyParts) do
-                    if part and part.Parent then part.CanCollide = false end
+                if not currentHrp or not currentHum then break end
+
+                -- Мгновенная регистрация касания пады: программный touch interest + физическое позиционирование
+                if touchFn and bestPadPart then
+                    pcall(function()
+                        touchFn(currentHrp, bestPadPart, 0)
+                        touchFn(currentHrp, bestPadPart, 1)
+                    end)
+                end
+                currentChar:PivotTo(bestCFrame)
+
+                voteCount = voteCount + 1
+                UpdateStatus(string.format("Голос: [%s] (%d)", bestMap, voteCount), Color3.fromRGB(50, 255, 255))
+
+                -- Минимальная пауза 0.04с для гарантированной отправки сетевого пакета касания
+                task.wait(0.04)
+
+                -- Если спам выключен или раунд начался — выходим БЕЗ сброса (персонаж остаётся живым)
+                if not SETTINGS.VoteSpamEnabled or voteCount >= maxVotes or rt:CheckIfGameInProgress() or not SETTINGS.AutoVoteEnabled then
+                    break
                 end
 
-                if currentHum then currentHum.PlatformStand = true end
+                -- Мгновенный сброс, чтобы сервер сразу начал отсчёт респавна (~0.8с)
+                pcall(function()
+                    currentHum.Health = 0
+                    currentChar:BreakJoints()
+                end)
 
-                -- Зависаем в воздухе без падения (BodyVelocity + BodyGyro)
+                -- Ждём следующее тело строго через событие (0% лишней нагрузки, 1 голос = 1 тело)
+                local okNew, newChar = pcall(function()
+                    return LocalPlayer.CharacterAdded:Wait()
+                end)
+                if not okNew or not newChar then break end
+                currentChar = newChar
+                currentHrp = (currentChar:WaitForChild("HumanoidRootPart", 3) or currentChar.PrimaryPart) :: BasePart?
+                currentHum = currentChar:FindFirstChildOfClass("Humanoid")
+            end
+
+            HasVoted = true
+            UpdateStatus(string.format("Голос: Отдан (%d за %s). Ожидание раунда...", voteCount, bestMap), Color3.fromRGB(100, 255, 100))
+
+            -- После завершения голосования фиксируем живого персонажа под стендом
+            if currentChar and currentHrp and currentHum and currentHum.Health > 0 then
+                currentHum.PlatformStand = true
+                currentHrp.AssemblyLinearVelocity = Vector3.zero
+                currentHrp.AssemblyAngularVelocity = Vector3.zero
+
                 local holdV = currentHrp:FindFirstChild("VoteHover") or Instance.new("BodyVelocity")
                 holdV.Name = "VoteHover"
                 holdV.Velocity = Vector3.zero
@@ -3694,47 +3730,7 @@ task.spawn(function()
                 holdG.P = 3000
                 holdG.Parent = currentHrp
 
-                currentHrp.AssemblyLinearVelocity = Vector3.zero
-                currentHrp.AssemblyAngularVelocity = Vector3.zero
-                char:PivotTo(bestCFrame)
-
-                voteCount = voteCount + 1
-                UpdateStatus(string.format("Голос: [%s] (%d/%d)", bestMap, voteCount, maxVotes), Color3.fromRGB(50, 255, 255))
-
-                -- Пауза для фиксации пакета координат сервером MM2
-                task.wait(0.12)
-
-                -- Если спам выключен или лимит достигнут — выходим сразу БЕЗ сброса (остаемся парить под полом)
-                if not SETTINGS.VoteSpamEnabled or voteCount >= maxVotes or rt:CheckIfGameInProgress() or not SETTINGS.AutoVoteEnabled then
-                    break
-                end
-
-                -- Для следующей итерации спама удаляем ховер
-                if holdV and holdV.Parent then holdV:Destroy() end
-                if holdG and holdG.Parent then holdG:Destroy() end
-
-                -- Быстрый сброс персонажа без блокирующего ожидания возрождения
-                pcall(function()
-                    if currentHum then currentHum.Health = 0 end
-                    char:BreakJoints()
-                end)
-
-                -- Сразу после сброса повторно телепортируем останки/персонажа на стенд
-                pcall(function()
-                    char:PivotTo(bestCFrame)
-                end)
-
-                task.wait(0.08)
-            end
-
-            HasVoted = true
-            UpdateStatus(string.format("Голос: Отдан (%d за %s). Ожидание раунда...", voteCount, bestMap), Color3.fromRGB(100, 255, 100))
-
-            -- Если персонаж погиб во время спама, ждём финального возрождения один раз для парения под стендом
-            if not currentChar or not currentHum or currentHum.Health <= 0 then
-                currentChar = LocalPlayer.CharacterAdded:Wait()
-                currentHrp = (currentChar:WaitForChild("HumanoidRootPart", 5) or currentChar.PrimaryPart) :: BasePart?
-                currentHum = currentChar:WaitForChild("Humanoid", 5) :: Humanoid?
+                currentChar:PivotTo(bestCFrame)
             end
 
             -- Остаемся парить в нижней области стенда под полом в noclip до старта раунда
