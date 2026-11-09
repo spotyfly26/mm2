@@ -1,7 +1,7 @@
 --!strict
 -- =====================================================================
 -- MM2 AUTO-FARM & ASSASSIN KILLER [MODERNIZED TURBO HYBRID]
--- 1. Режимы зачистки: С ТВИНКОМ (остановка на твинке) / СОЛО (остановка при 2 игроках).
+-- 1. Режимы игры: ASSASSIN (остановка при 2 игроках) / CLEAR (до последнего игрока) / CLASSIC (без зачистки).
 -- 2. TurboKill: Двойной импульс touchinterest по хитбоксу без телепортов и зависаний.
 -- 3. Реактивный перехват ChangeTarget и RoundEndFade (0 мс задержки) + UI Watchdog.
 -- 4. Переключатель действия при полной сумке: РЕСЕТ / KILL ALL / AFK.
@@ -100,7 +100,7 @@ local SETTINGS = {
     PotatoMode = (initialProfile and initialProfile.PotatoMode == true) or false,
     BagFullMode = (initialProfile and (initialProfile.BagFullMode == "KillAll" or initialProfile.BagFullMode == "Reset" or initialProfile.BagFullMode == "AFK") and initialProfile.BagFullMode) or "Reset",
     GameMode = (initialProfile and (initialProfile.GameMode == "Twin" or initialProfile.GameMode == "Solo") and initialProfile.GameMode) or (initialSavedTwin ~= "" and "Twin" or "Solo"),
-    RoundMode = (initialProfile and (initialProfile.RoundMode == "Classic" or initialProfile.RoundMode == "Assassin") and initialProfile.RoundMode) or "Assassin",
+    RoundMode = (initialProfile and (initialProfile.RoundMode == "Classic" or initialProfile.RoundMode == "Assassin" or initialProfile.RoundMode == "Clear") and initialProfile.RoundMode) or "Assassin",
     TwinName = initialSavedTwin,
     TwinAvoidEnabled = true, -- Умное разделение зон фарма с твинком (без гонок за одной монетой)
     TwinAvoidRadius = 30, -- Компактная сфера влияния твинка (студы)
@@ -644,7 +644,7 @@ local function SetupRemoteHooks()
     if giveWeapon then
         RegisterConnection(giveWeapon.OnClientEvent:Connect(function(wName)
             if IsTerminated then return end
-            if CurrentState == State.Action and SETTINGS.RoundMode == "Assassin" then
+            if CurrentState == State.Action and (SETTINGS.RoundMode == "Assassin" or SETTINGS.RoundMode == "Clear") then
                 InspectAndEquipKnife()
             end
         end))
@@ -1581,7 +1581,7 @@ local function PreRoundKillChain()
     if not knife then
         UpdateStatus("Зачистка: Ожидание выдачи ножа сервером...", Color3.fromRGB(255, 200, 100))
         local waitKnifeStart = tick()
-        while not knife and tick() - waitKnifeStart < 30 and not IsTerminated and RoundInProgress() and rt:CheckIfPlayerWasInARound() and CurrentState == State.Action and not BagIsFull and SETTINGS.RoundMode == "Assassin" do
+        while not knife and tick() - waitKnifeStart < 30 and not IsTerminated and RoundInProgress() and rt:CheckIfPlayerWasInARound() and CurrentState == State.Action and not BagIsFull and (SETTINGS.RoundMode == "Assassin" or SETTINGS.RoundMode == "Clear") do
             task.wait(0.2)
             knife = InspectAndEquipKnife()
         end
@@ -1598,7 +1598,7 @@ local function PreRoundKillChain()
         pcall(function() knifeClient.Disabled = true end)
     end
 
-    UpdateStatus("Зачистка: Старт цепочки (" .. (SETTINGS.GameMode == "Twin" and "С Твинком" or "Соло") .. ")", Color3.fromRGB(255, 180, 50))
+    UpdateStatus("Зачистка [" .. SETTINGS.RoundMode .. "]: Старт цепочки (" .. (SETTINGS.GameMode == "Twin" and "С Твинком" or "Соло") .. ")", Color3.fromRGB(255, 180, 50))
 
     local isChainRunning = true
     local activeTargetPlayer: Player? = nil
@@ -1611,7 +1611,7 @@ local function PreRoundKillChain()
     local uiTextConn: RBXScriptConnection? = nil
 
     local function TryEliminateTarget(plr: Player, rawName: string?)
-        if not isChainRunning or IsTerminated or SETTINGS.RoundMode ~= "Assassin" then
+        if not isChainRunning or IsTerminated or (SETTINGS.RoundMode ~= "Assassin" and SETTINGS.RoundMode ~= "Clear") then
             isChainRunning = false
             return
         end
@@ -1620,8 +1620,8 @@ local function PreRoundKillChain()
         local hum = plr.Character:FindFirstChildOfClass("Humanoid")
         if not hum or hum.Health <= 0 then return end
 
-        -- 1. Проверка режима "С ТВИНКОМ": если цель Твинк — зачистка моментально останавливается!
-        if SETTINGS.GameMode == "Twin" and IsTwinPlayer(plr, rawName) then
+        -- 1. Проверка режима "С ТВИНКОМ": если цель Твинк — зачистка моментально останавливается (в режиме Assassin)!
+        if SETTINGS.RoundMode ~= "Clear" and SETTINGS.GameMode == "Twin" and IsTwinPlayer(plr, rawName) then
             UpdateStatus("Зачистка: Цель — Твинк (" .. plr.DisplayName .. ")! Стоп.", Color3.fromRGB(100, 255, 120))
             isChainRunning = false
             return
@@ -1630,18 +1630,27 @@ local function PreRoundKillChain()
         -- 2. Проверка количества живых игроков
         local aliveCount = CountAliveRoundPlayers()
 
-        -- Режим "СОЛО": если в раунде осталось 2 игрока (я + 1 соперник) — цель убивать нельзя!
-        if SETTINGS.GameMode == "Solo" and aliveCount <= 2 then
-            UpdateStatus("Зачистка: Осталось 2 игрока (я + соперник). Стоп.", Color3.fromRGB(100, 255, 120))
-            isChainRunning = false
-            return
-        end
+        if SETTINGS.RoundMode == "Clear" then
+            -- Режим "CLEAR": зачистка идет до последнего выжившего (остался только он один)
+            if aliveCount <= 1 then
+                UpdateStatus("Зачистка: В раунде остался только один игрок. Стоп.", Color3.fromRGB(100, 255, 120))
+                isChainRunning = false
+                return
+            end
+        else
+            -- Режим "СОЛО": если в раунде осталось 2 игрока (я + 1 соперник) — цель убивать нельзя!
+            if SETTINGS.GameMode == "Solo" and aliveCount <= 2 then
+                UpdateStatus("Зачистка: Осталось 2 игрока (я + соперник). Стоп.", Color3.fromRGB(100, 255, 120))
+                isChainRunning = false
+                return
+            end
 
-        -- Резервная защита для режима с твинком
-        if SETTINGS.GameMode == "Twin" and aliveCount <= 2 then
-            UpdateStatus("Зачистка: Осталось 2 игрока (я + твинк). Стоп.", Color3.fromRGB(100, 255, 120))
-            isChainRunning = false
-            return
+            -- Резервная защита для режима с твинком
+            if SETTINGS.GameMode == "Twin" and aliveCount <= 2 then
+                UpdateStatus("Зачистка: Осталось 2 игрока (я + твинк). Стоп.", Color3.fromRGB(100, 255, 120))
+                isChainRunning = false
+                return
+            end
         end
 
         -- 3. Нанесение удара через TurboKill
@@ -1709,7 +1718,7 @@ local function PreRoundKillChain()
     local noTargetStreak = 0
     local startTime = tick()
 
-    while isChainRunning and not IsTerminated and SETTINGS.AutoFarmEnabled and CurrentState == State.Action and not BagIsFull and SETTINGS.RoundMode == "Assassin" do
+    while isChainRunning and not IsTerminated and SETTINGS.AutoFarmEnabled and CurrentState == State.Action and not BagIsFull and (SETTINGS.RoundMode == "Assassin" or SETTINGS.RoundMode == "Clear") do
         task.wait(0.05)
 
         -- Проверка нашего персонажа и раунда
@@ -1720,8 +1729,9 @@ local function PreRoundKillChain()
 
         -- Проверка количества живых игроков
         local aliveCount = CountAliveRoundPlayers()
-        if aliveCount <= 2 then
-            UpdateStatus("Зачистка: Осталось " .. aliveCount .. " участников. Завершено.", Color3.fromRGB(100, 255, 120))
+        local stopLimit = (SETTINGS.RoundMode == "Clear") and 1 or 2
+        if aliveCount <= stopLimit then
+            UpdateStatus("Зачистка: " .. (aliveCount <= 1 and "Остался 1 участник (только вы)" or ("Осталось " .. aliveCount .. " участников")) .. ". Завершено.", Color3.fromRGB(100, 255, 120))
             break
         end
 
@@ -1729,12 +1739,12 @@ local function PreRoundKillChain()
         if activeTargetPlayer and activeTargetPlayer.Character then
             local tHum = activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid")
             if tHum and tHum.Health > 0 then
-                if SETTINGS.GameMode == "Twin" and IsTwinPlayer(activeTargetPlayer, activeTargetName) then
+                if SETTINGS.RoundMode ~= "Clear" and SETTINGS.GameMode == "Twin" and IsTwinPlayer(activeTargetPlayer, activeTargetName) then
                     UpdateStatus("Зачистка: Цель — Твинк. Стоп.", Color3.fromRGB(100, 255, 120))
                     break
                 end
 
-                if aliveCount <= 2 then break end
+                if aliveCount <= stopLimit then break end
 
                 knife = InspectAndEquipKnife() or knife
                 TurboKill(activeTargetPlayer, knife)
@@ -2401,12 +2411,25 @@ GameModeBtn.Active = true
 GameModeBtn.ZIndex = 10
 Instance.new("UICorner", GameModeBtn).CornerRadius = UDim.new(0, 6)
 
--- Кнопка переключения режима игры: ASSASSIN / CLASSIC
+-- Кнопка переключения режима игры: ASSASSIN / CLEAR / CLASSIC
 local RoundModeBtn = Instance.new("TextButton", SettingsContainer)
 RoundModeBtn.Name = "RoundModeBtn"
 RoundModeBtn.Size = UDim2.new(1, 0, 0, 35)
-RoundModeBtn.BackgroundColor3 = (SETTINGS.RoundMode == "Assassin") and Color3.fromRGB(150, 40, 180) or Color3.fromRGB(45, 125, 245)
-RoundModeBtn.Text = (SETTINGS.RoundMode == "Assassin") and "РЕЖИМ: ASSASSIN" or "РЕЖИМ: CLASSIC"
+
+local function UpdateRoundModeBtnVisual()
+    if SETTINGS.RoundMode == "Assassin" then
+        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 180)
+        RoundModeBtn.Text = "РЕЖИМ: ASSASSIN"
+    elseif SETTINGS.RoundMode == "Clear" then
+        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 60)
+        RoundModeBtn.Text = "РЕЖИМ: CLEAR"
+    else
+        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+        RoundModeBtn.Text = "РЕЖИМ: CLASSIC"
+    end
+end
+UpdateRoundModeBtnVisual()
+
 RoundModeBtn.TextColor3 = Color3.new(1, 1, 1)
 RoundModeBtn.Font = Enum.Font.GothamSemibold
 RoundModeBtn.TextSize = 13
@@ -2594,19 +2617,28 @@ BindClick(BagModeBtn, function()
     end
 end)
 
--- Переключение режима игры: ASSASSIN / CLASSIC
+-- Переключение режима игры: ASSASSIN -> CLEAR -> CLASSIC
 BindClick(RoundModeBtn, function()
     if SETTINGS.RoundMode == "Assassin" then
+        SETTINGS.RoundMode = "Clear"
+        UpdateRoundModeBtnVisual()
+        UpdateStatus("Режим: Clear (полная зачистка до 1 игрока)", Color3.fromRGB(255, 90, 90))
+
+        -- Если раунд уже идет прямо сейчас, мгновенно подключаем фоновую зачистку
+        if SETTINGS.AutoFarmEnabled and not IsTerminated and CurrentState == State.Action and RoundInProgress() and rt:CheckIfPlayerWasInARound() and not BagIsFull then
+            task.spawn(function()
+                PreRoundKillChain()
+            end)
+        end
+    elseif SETTINGS.RoundMode == "Clear" then
         SETTINGS.RoundMode = "Classic"
-        RoundModeBtn.Text = "РЕЖИМ: CLASSIC"
-        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+        UpdateRoundModeBtnVisual()
         UnequipKnife()
         UpdateStatus("Режим: Classic (зачистка отключена)", Color3.fromRGB(100, 200, 255))
     else
         SETTINGS.RoundMode = "Assassin"
-        RoundModeBtn.Text = "РЕЖИМ: ASSASSIN"
-        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 180)
-        UpdateStatus("Режим: Assassin (зачистка активна)", Color3.fromRGB(220, 120, 255))
+        UpdateRoundModeBtnVisual()
+        UpdateStatus("Режим: Assassin (зачистка до 2 игроков)", Color3.fromRGB(220, 120, 255))
 
         -- Если раунд уже идет прямо сейчас, мгновенно подключаем фоновую зачистку
         if SETTINGS.AutoFarmEnabled and not IsTerminated and CurrentState == State.Action and RoundInProgress() and rt:CheckIfPlayerWasInARound() and not BagIsFull then
@@ -3231,7 +3263,7 @@ end
 -- === ОСНОВНОЕ ДЕЙСТВИЕ В РАУНДЕ (ЗАЧИСТКА -> ФАРМ -> ОБРАБОТКА СУМКИ) ===
 local function ActionState()
     -- 1. Предварительная зачистка (PreRoundKillChain) запускается параллельно в фоновом потоке
-    if SETTINGS.RoundMode == "Assassin" and SETTINGS.AutoFarmEnabled and not IsTerminated and RoundInProgress() and rt:CheckIfPlayerWasInARound() then
+    if (SETTINGS.RoundMode == "Assassin" or SETTINGS.RoundMode == "Clear") and SETTINGS.AutoFarmEnabled and not IsTerminated and RoundInProgress() and rt:CheckIfPlayerWasInARound() then
         task.spawn(function()
             PreRoundKillChain()
         end)
