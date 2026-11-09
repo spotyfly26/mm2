@@ -413,6 +413,7 @@ end
 -- СИСТЕМА УЧЕТА КАРТЫ И МОНЕТ В WORKSPACE (ИЗ 44.LUA)
 -- =====================================================================
 local CurrentMapInstance: Instance? = nil
+local CurrentMapSpawnPosition: Vector3? = nil
 local candidateConnections: { [Instance]: { RBXScriptConnection } } = {}
 
 local function DisconnectCandidate(child: Instance)
@@ -437,15 +438,48 @@ local function CleanupMap(child: Instance)
     DisconnectCandidate(child)
     if CurrentMapInstance == child then
         CurrentMapInstance = nil
+        CurrentMapSpawnPosition = nil
         rt.coinContainer = nil
         AutoFarmCleanUp()
     end
+end
+
+local function GetMapSpawnPosition(): Vector3?
+    if CurrentMapSpawnPosition then return CurrentMapSpawnPosition end
+    if not CurrentMapInstance or CurrentMapInstance.Parent ~= Workspace then return nil end
+    local spawns = CurrentMapInstance:FindFirstChild("Spawns")
+    if spawns then
+        local p = spawns:FindFirstChildWhichIsA("BasePart", true)
+        if p then
+            CurrentMapSpawnPosition = p.Position
+            return p.Position
+        end
+    end
+    if CurrentMapInstance:IsA("Model") then
+        local ok, cf = pcall(function() return (CurrentMapInstance :: Model):GetPivot() end)
+        if ok and cf then
+            CurrentMapSpawnPosition = cf.Position
+            return cf.Position
+        end
+    end
+    return nil
 end
 
 local function RegisterMap(child: Instance, spawns: Instance?, container: Instance?)
     if CurrentMapInstance == child then return end
     CurrentMapInstance = child
     DisconnectCandidate(child)
+
+    CurrentMapSpawnPosition = nil
+    local s = spawns or child:FindFirstChild("Spawns")
+    if s then
+        local p = s:FindFirstChildWhichIsA("BasePart", true)
+        if p then CurrentMapSpawnPosition = p.Position end
+    end
+    if not CurrentMapSpawnPosition and child:IsA("Model") then
+        local ok, cf = pcall(function() return child:GetPivot() end)
+        if ok and cf then CurrentMapSpawnPosition = cf.Position end
+    end
 
     if container then
         rt.coinContainer = container
@@ -636,11 +670,14 @@ function rt:CheckIfPlayerWasInARound(): boolean
         return cachedStatus == false
     end
 
-    -- Проверка выдачи роли через RoleSelect или атрибут Alive:
-    -- если роль выдана — сервер перенёс персонажа на карту в раунд
-    if HasAssignedRole() then
-        PlayerAliveCache[LocalPlayer.Name] = false
-        return true
+    -- Проверка физического переноса персонажа на карту (к Spawns карты, а не в лобби)
+    local spawnPos = GetMapSpawnPosition()
+    if spawnPos then
+        local hrp = char.PrimaryPart or char:FindFirstChild("HumanoidRootPart") :: BasePart?
+        if hrp and (hrp.Position - spawnPos).Magnitude < 250 then
+            PlayerAliveCache[LocalPlayer.Name] = false
+            return true
+        end
     end
 
     -- nil -> Ремоуты ещё не стреляли (скрипт запущен посреди уже идущего раунда).
@@ -680,7 +717,6 @@ local function SetupRemoteHooks()
             DoForceCheckMap()
             if role then
                 PlayerRolesCache[LocalPlayer.Name] = tostring(role)
-                PlayerAliveCache[LocalPlayer.Name] = false
             end
         end))
     end
@@ -3194,20 +3230,35 @@ local function CollectCoins()
     bg.Parent = hrp
 
     -- Сейф-зона в начале раунда:
-    -- 1. Если бот зашёл посреди раунда и монеты УЖЕ есть на карте — сейф-зона пропускается,
-    --    и скрипт сразу летит к первой монете без лишней задержки.
-    -- 2. Если монет ещё нет, телепортация в сейф-зону выполняется строго по факту выдачи роли (RoleSelect),
-    --    когда сервер перенёс персонажа на карту, чтобы безопасно переждать спавн монет под полом.
+    -- 1. Если монеты УЖЕ есть на карте (скрипт запущен посреди раунда) — сейф-зона пропускается,
+    --    и скрипт сразу летит к первой монете без задержки.
+    -- 2. Если спавн монет ещё идёт (монет ещё нет) и карта загружена:
+    --    страхуемся от сетевого рассинхрона (ждём подтверждения переноса к Spawns карты, а не лобби)
+    --    и моментально прячемся под пол (SafeUnderfloorY).
     local alreadyHasCoins = (GetNearestCoin() ~= nil)
-    local hasRole = HasAssignedRole()
-    if not alreadyHasCoins and hasRole then
+    if not alreadyHasCoins then
+        local spawnPos = GetMapSpawnPosition()
+        if spawnPos and (hrp.Position - spawnPos).Magnitude > 250 then
+            local waitStart = tick()
+            while (hrp.Position - spawnPos).Magnitude > 250 and (tick() - waitStart < 2) and not IsTerminated and RoundInProgress() do
+                RunService.Heartbeat:Wait()
+            end
+        end
+
         local safeY = SETTINGS.SafeUnderfloorY or -120
-        local safePos = Vector3.new(hrp.Position.X, safeY, hrp.Position.Z)
+        local targetX = hrp.Position.X
+        local targetZ = hrp.Position.Z
+        if spawnPos and (hrp.Position - spawnPos).Magnitude > 300 then
+            targetX = spawnPos.X
+            targetZ = spawnPos.Z
+        end
+
+        local safePos = Vector3.new(targetX, safeY, targetZ)
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
         char:PivotTo(CFrame.new(safePos))
         bv.Velocity = Vector3.zero
-        UpdateStatus("Фарм: Сейф-зона (роль получена, ожидание монет)", Color3.fromRGB(130, 200, 255))
+        UpdateStatus("Фарм: Сейф-зона (ожидание монет)", Color3.fromRGB(130, 200, 255))
     end
 
     local isFirstCoin = true
