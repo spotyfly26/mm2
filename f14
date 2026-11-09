@@ -105,7 +105,7 @@ local SETTINGS = {
     TwinAvoidEnabled = true, -- Умное разделение зон фарма с твинком (без гонок за одной монетой)
     TwinAvoidRadius = 30, -- Компактная сфера влияния твинка (студы)
     UnderfloorOffset = 3.8, -- Смещение под карту (студы ниже монеты)
-    SafeUnderfloorY = -1, -- Безопасная глубина сейф-зоны до спавна монет
+    SafeUnderfloorY = 50, -- Безопасная глубина сейф-зоны до спавна монет
     AutoRejoinEnabled = (initialProfile and initialProfile.AutoRejoinEnabled == true) or false,
     RejoinTime = (initialProfile and typeof(initialProfile.RejoinTime) == "number" and initialProfile.RejoinTime > 0 and initialProfile.RejoinTime) or 5400,
     RejoinServerMode = (initialProfile and (initialProfile.RejoinServerMode == "Same" or initialProfile.RejoinServerMode == "Random") and initialProfile.RejoinServerMode) or "Same",
@@ -3645,7 +3645,7 @@ task.spawn(function()
         end
 
         if bestMap and bestPriority < 999 and bestCFrame then
-            local maxVotes = SETTINGS.VoteSpamEnabled and 11 or 1
+            local maxVotes = SETTINGS.VoteSpamEnabled and 50 or 1
             UpdateStatus(string.format("Голос: Старт (%s, %s)", bestMap, SETTINGS.VoteSpamEnabled and "спам до 11" or "1 голос"), Color3.fromRGB(50, 255, 255))
 
             local voteCount = 0
