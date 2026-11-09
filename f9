@@ -253,7 +253,7 @@ RegisterConnection(RunService.Stepped:Connect(function()
     if IsTerminated then return end
     if isVotingNoclip or (SETTINGS.AutoFarmEnabled and CurrentState == State.Action and rt:CheckIfPlayerWasInARound()) then
         for _, part in ipairs(rt.cachedBodyParts) do
-            if part and part.Parent then
+            if part and part.Parent and part.CanCollide then
                 part.CanCollide = false
             end
         end
@@ -279,6 +279,18 @@ end
 -- Сетевые кэши состояния раунда и игроков
 local PlayerRolesCache: { [string]: string } = {}
 local PlayerAliveCache: { [string]: boolean } = {} -- true = мертв, false = жив
+
+local function HasAssignedRole(plr: Player?): boolean
+    local target = plr or LocalPlayer
+    local role = PlayerRolesCache[target.Name]
+    if role and role ~= "" and role ~= "nil" then
+        return true
+    end
+    if target:GetAttribute("Alive") == true then
+        return true
+    end
+    return false
+end
 
 local function IsPlayerActuallyAlive(plr: Player): boolean
     local char = plr.Character
@@ -309,11 +321,15 @@ local function AutoFarmCleanUp()
     end
     rt.coinContainer = nil
 
-    -- Безопасная обратная очистка отключенных соединений из массива ActiveConnections
-    for i = #ActiveConnections, 1, -1 do
-        local conn = ActiveConnections[i]
+    -- Безопасная swap-and-pop очистка отключенных соединений из массива ActiveConnections (O(1) на удаление)
+    local connIdx = 1
+    while connIdx <= #ActiveConnections do
+        local conn = ActiveConnections[connIdx]
         if not conn or not conn.Connected then
-            table.remove(ActiveConnections, i)
+            ActiveConnections[connIdx] = ActiveConnections[#ActiveConnections]
+            ActiveConnections[#ActiveConnections] = nil
+        else
+            connIdx = connIdx + 1
         end
     end
 end
@@ -620,6 +636,13 @@ function rt:CheckIfPlayerWasInARound(): boolean
         return cachedStatus == false
     end
 
+    -- Проверка выдачи роли через RoleSelect или атрибут Alive:
+    -- если роль выдана — сервер перенёс персонажа на карту в раунд
+    if HasAssignedRole() then
+        PlayerAliveCache[LocalPlayer.Name] = false
+        return true
+    end
+
     -- nil -> Ремоуты ещё не стреляли (скрипт запущен посреди уже идущего раунда).
     -- Выполняем лёгкий fallback через видимость сумки на экране (CoinBags.Visible).
     if CheckBagGuiVisible() then
@@ -655,7 +678,10 @@ local function SetupRemoteHooks()
         RegisterConnection(roleSelect.OnClientEvent:Connect(function(role)
             if IsTerminated then return end
             DoForceCheckMap()
-            if role then PlayerRolesCache[LocalPlayer.Name] = tostring(role) end
+            if role then
+                PlayerRolesCache[LocalPlayer.Name] = tostring(role)
+                PlayerAliveCache[LocalPlayer.Name] = false
+            end
         end))
     end
 
@@ -1389,27 +1415,26 @@ local function FindPlayerByName(cleanName: string): (Player?, string)
     end
 
     local exact = Players:FindFirstChild(cleanName)
-    if exact then return exact, "Exact" end
+    if exact and exact:IsA("Player") and exact ~= LocalPlayer then
+        return exact, "Exact"
+    end
 
     local lowerClean = string.lower(cleanName)
+    local partialMatch: Player? = nil
+
     for _, pl in ipairs(Players:GetPlayers()) do
         if pl ~= LocalPlayer then
-            if string.lower(pl.Name) == lowerClean or string.lower(pl.DisplayName) == lowerClean then
+            local ln = string.lower(pl.Name)
+            local ldn = string.lower(pl.DisplayName)
+            if ln == lowerClean or ldn == lowerClean then
                 return pl, "Match"
+            elseif not partialMatch and (string.find(ln, lowerClean, 1, true) or string.find(ldn, lowerClean, 1, true)) then
+                partialMatch = pl
             end
         end
     end
 
-    for _, pl in ipairs(Players:GetPlayers()) do
-        if pl ~= LocalPlayer then
-            if string.find(string.lower(pl.Name), lowerClean, 1, true)
-               or string.find(string.lower(pl.DisplayName), lowerClean, 1, true) then
-                return pl, "Partial"
-            end
-        end
-    end
-
-    return nil, "Не найден"
+    return partialMatch, partialMatch and "Partial" or "Не найден"
 end
 
 local function RunTargetScan(): Player?
@@ -1426,7 +1451,7 @@ end
 
 -- === ПРОВЕРКА НА СОВПАДЕНИЕ С ТВИНКОМ ===
 local function IsTwinPlayer(targetPlayer: Player?, rawName: string?): boolean
-    local twin = string.lower(string.gsub(SETTINGS.TwinName or "", "^%s*(.-)%s*$", "%1"))
+    local twin = cachedCleanTwin
     if twin == "" then return false end
 
     if targetPlayer then
@@ -1751,8 +1776,16 @@ local function PreRoundKillChain()
             end
         end
 
-        -- Проверка UI если сетевой цели нет
-        local currentLbl = FindTargetLabel()
+        -- Проверка UI если сетевой цели нет (с ленивым кэшированием)
+        if not targetLabel or not targetLabel.Parent then
+            targetLabel = FindTargetLabel()
+            if targetLabel and not uiTextConn then
+                uiTextConn = targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                    CheckFromUi()
+                end)
+            end
+        end
+        local currentLbl = targetLabel
         local isVis = IsTargetVisible(currentLbl)
         local raw = currentLbl and currentLbl.Text or ""
         local clean = CleanNickname(raw)
@@ -3161,17 +3194,20 @@ local function CollectCoins()
     bg.Parent = hrp
 
     -- Сейф-зона в начале раунда:
-    -- Если бот вошел посреди раунда и монеты УЖЕ есть на карте — сейф-зона пропускается,
-    -- и скрипт сразу телепортируется к первой монете без лишней задержки.
+    -- 1. Если бот зашёл посреди раунда и монеты УЖЕ есть на карте — сейф-зона пропускается,
+    --    и скрипт сразу летит к первой монете без лишней задержки.
+    -- 2. Если монет ещё нет, телепортация в сейф-зону выполняется строго по факту выдачи роли (RoleSelect),
+    --    когда сервер перенёс персонажа на карту, чтобы безопасно переждать спавн монет под полом.
     local alreadyHasCoins = (GetNearestCoin() ~= nil)
-    if not alreadyHasCoins then
+    local hasRole = HasAssignedRole()
+    if not alreadyHasCoins and hasRole then
         local safeY = SETTINGS.SafeUnderfloorY or -120
         local safePos = Vector3.new(hrp.Position.X, safeY, hrp.Position.Z)
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
         char:PivotTo(CFrame.new(safePos))
         bv.Velocity = Vector3.zero
-        UpdateStatus("Фарм: Сейф-зона (ожидание монет)", Color3.fromRGB(130, 200, 255))
+        UpdateStatus("Фарм: Сейф-зона (роль получена, ожидание монет)", Color3.fromRGB(130, 200, 255))
     end
 
     local isFirstCoin = true
