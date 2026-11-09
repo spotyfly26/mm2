@@ -1,0 +1,1753 @@
+--!strict
+-- =====================================================================
+-- MM2 STATE & ROUND DIAGNOSTIC MONITOR [v1.0]
+-- Специализированный диагностический логгер состояний раунда MM2:
+-- 1. СЕТЕВЫЕ СОБЫТИЯ (RemoteEvents):
+--    • RoleSelect (выбор/выдача ролей, определение старта)
+--    • RoundStart (официальный старт раунда и длительность)
+--    • RoundEndFade (завершение раунда сервером)
+--    • ChangeTarget (система целей в Assassin)
+--    • GiveWeapon (выдача ножа/пистолета сервером)
+--    • PlayerDataChanged (синхронизация состояния: монеты других игроков, живые/мертвые, роли)
+--    • KillEvent / SpecialXPEvent (убийства и события)
+-- 2. КАРТА И МОНЕТЫ (Workspace & Physics):
+--    • Спавн карты (Workspace.ChildAdded с поиском CoinContainer / Spawns)
+--    • Удаление карты (Workspace.ChildRemoved)
+--    • Спавн CoinContainer и первой монеты (засечка времени от спавна карты)
+--    • Динамика монет (счетчик активных монет в контейнере)
+-- 3. ГОЛОСОВАНИЕ (Lobby VotePads):
+--    • Начало голосования (появление вариантов на VotePads)
+--    • Конец голосования / Выбор карты (очистка падов или исчезновение GUI)
+-- 4. СОСТОЯНИЕ LOCALPLAYER & ATTRIBUTES:
+--    • Атрибут "Alive", "Elite", изменение HP Humanoid, смена Character
+-- 5. ЭКСПОРТ ЛОГОВ:
+--    • Запись в файл mm2_round_diagnostic.txt через writefile
+--    • Копирование логов в буфер обмена (setclipboard)
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+while not Players.LocalPlayer do task.wait(0.1) end
+local LocalPlayer = Players.LocalPlayer
+
+local isTerminated = false
+local activeConnections: { RBXScriptConnection } = {}
+
+-- =====================================================================
+-- GUI ИНТЕРФЕЙС
+-- =====================================================================
+local function GetSafeGuiParent(): Instance
+    local success, result = pcall(function() return gethui() end)
+    if success and result then return result end
+    local coreSuccess, coreResult = pcall(function() return game:GetService("CoreGui") end)
+    if coreSuccess and coreResult then return coreResult end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local safeParent = GetSafeGuiParent()
+local oldGui = safeParent:FindFirstChild("MM2_RoundMonitor_Gui")
+if oldGui then pcall(function() oldGui:Destroy() end) end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "MM2_RoundMonitor_Gui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = safeParent
+
+local WINDOW_WIDTH = 420
+local EXPANDED_HEIGHT = 440
+local COLLAPSED_HEIGHT = 160
+local isLogsCollapsed = false
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, WINDOW_WIDTH, 0, EXPANDED_HEIGHT)
+MainFrame.Position = UDim2.new(0.04, 0, 0.15, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(16, 17, 24)
+MainFrame.BorderSizePixel = 0
+MainFrame.Active = true
+MainFrame.ClipsDescendants = false
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Color = Color3.fromRGB(50, 60, 85)
+MainStroke.Thickness = 1.2
+
+-- Заголовок
+local TitleBar = Instance.new("Frame")
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 32)
+TitleBar.BackgroundColor3 = Color3.fromRGB(24, 26, 38)
+TitleBar.BorderSizePixel = 0
+TitleBar.Parent = MainFrame
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -145, 1, 0)
+TitleLabel.Position = UDim2.new(0, 10, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "🛰 MM2 ROUND & STATE MONITOR v1.0"
+TitleLabel.TextColor3 = Color3.fromRGB(110, 210, 255)
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 12
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TitleBar
+
+-- Кнопка быстрого копирования логов в шапке
+local CopyTitleBtn = Instance.new("TextButton")
+CopyTitleBtn.Size = UDim2.new(0, 26, 0, 22)
+CopyTitleBtn.Position = UDim2.new(1, -114, 0, 5)
+CopyTitleBtn.BackgroundColor3 = Color3.fromRGB(45, 95, 70)
+CopyTitleBtn.Text = "📋"
+CopyTitleBtn.TextColor3 = Color3.new(1, 1, 1)
+CopyTitleBtn.Font = Enum.Font.GothamBold
+CopyTitleBtn.TextSize = 12
+CopyTitleBtn.Parent = TitleBar
+Instance.new("UICorner", CopyTitleBtn).CornerRadius = UDim.new(0, 5)
+
+local CopyTitleBtnStroke = Instance.new("UIStroke", CopyTitleBtn)
+CopyTitleBtnStroke.Color = Color3.fromRGB(65, 135, 95)
+CopyTitleBtnStroke.Thickness = 1
+
+-- Кнопка разворачивания панели участников справа
+local PlayersBtn = Instance.new("TextButton")
+PlayersBtn.Size = UDim2.new(0, 26, 0, 22)
+PlayersBtn.Position = UDim2.new(1, -85, 0, 5)
+PlayersBtn.BackgroundColor3 = Color3.fromRGB(45, 55, 80)
+PlayersBtn.Text = "👥"
+PlayersBtn.TextColor3 = Color3.new(1, 1, 1)
+PlayersBtn.Font = Enum.Font.GothamBold
+PlayersBtn.TextSize = 12
+PlayersBtn.Parent = TitleBar
+Instance.new("UICorner", PlayersBtn).CornerRadius = UDim.new(0, 5)
+
+local PlayersBtnStroke = Instance.new("UIStroke", PlayersBtn)
+PlayersBtnStroke.Color = Color3.fromRGB(65, 85, 125)
+PlayersBtnStroke.Thickness = 1
+
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Size = UDim2.new(0, 24, 0, 22)
+ToggleBtn.Position = UDim2.new(1, -56, 0, 5)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+ToggleBtn.Text = "▲"
+ToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+ToggleBtn.Font = Enum.Font.GothamBold
+ToggleBtn.TextSize = 11
+ToggleBtn.Parent = TitleBar
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 5)
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0, 24, 0, 22)
+CloseBtn.Position = UDim2.new(1, -29, 0, 5)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(215, 45, 45)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.new(1, 1, 1)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 11
+CloseBtn.Parent = TitleBar
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 5)
+
+-- Перетаскивание окна
+local dragging, dragStart, startPos
+local dragInputConn: RBXScriptConnection? = nil
+TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+        if dragInputConn then dragInputConn:Disconnect() end
+        dragInputConn = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+                if dragInputConn then
+                    dragInputConn:Disconnect()
+                    dragInputConn = nil
+                end
+            end
+        end)
+    end
+end)
+
+local dragChangeConn = UserInputService.InputChanged:Connect(function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        local delta = input.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
+table.insert(activeConnections, dragChangeConn)
+
+-- Информационная панель текущего состояния
+local StateInfoFrame = Instance.new("Frame")
+StateInfoFrame.Size = UDim2.new(1, -16, 0, 58)
+StateInfoFrame.Position = UDim2.new(0, 8, 0, 36)
+StateInfoFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 34)
+StateInfoFrame.BorderSizePixel = 0
+StateInfoFrame.Parent = MainFrame
+Instance.new("UICorner", StateInfoFrame).CornerRadius = UDim.new(0, 6)
+
+local StateInfoStroke = Instance.new("UIStroke", StateInfoFrame)
+StateInfoStroke.Color = Color3.fromRGB(40, 45, 65)
+StateInfoStroke.Thickness = 1
+
+local LblCurrentMap = Instance.new("TextLabel")
+LblCurrentMap.Size = UDim2.new(0.5, -6, 0, 16)
+LblCurrentMap.Position = UDim2.new(0, 8, 0, 6)
+LblCurrentMap.BackgroundTransparency = 1
+LblCurrentMap.Text = "Карта: (нет)"
+LblCurrentMap.TextColor3 = Color3.fromRGB(200, 220, 255)
+LblCurrentMap.Font = Enum.Font.GothamSemibold
+LblCurrentMap.TextSize = 11
+LblCurrentMap.TextXAlignment = Enum.TextXAlignment.Left
+LblCurrentMap.Parent = StateInfoFrame
+
+local LblRoundStatus = Instance.new("TextLabel")
+LblRoundStatus.Size = UDim2.new(0.5, -6, 0, 16)
+LblRoundStatus.Position = UDim2.new(0.5, 2, 0, 6)
+LblRoundStatus.BackgroundTransparency = 1
+LblRoundStatus.Text = "Раунд: Ожидание"
+LblRoundStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
+LblRoundStatus.Font = Enum.Font.GothamSemibold
+LblRoundStatus.TextSize = 11
+LblRoundStatus.TextXAlignment = Enum.TextXAlignment.Left
+LblRoundStatus.Parent = StateInfoFrame
+
+local LblCoinsInfo = Instance.new("TextLabel")
+LblCoinsInfo.Size = UDim2.new(0.5, -6, 0, 16)
+LblCoinsInfo.Position = UDim2.new(0, 8, 0, 24)
+LblCoinsInfo.BackgroundTransparency = 1
+LblCoinsInfo.Text = "Монеты: 0 на карте"
+LblCoinsInfo.TextColor3 = Color3.fromRGB(255, 215, 80)
+LblCoinsInfo.Font = Enum.Font.GothamSemibold
+LblCoinsInfo.TextSize = 11
+LblCoinsInfo.TextXAlignment = Enum.TextXAlignment.Left
+LblCoinsInfo.Parent = StateInfoFrame
+
+local LblVoteStatus = Instance.new("TextLabel")
+LblVoteStatus.Size = UDim2.new(0.5, -6, 0, 16)
+LblVoteStatus.Position = UDim2.new(0.5, 2, 0, 24)
+LblVoteStatus.BackgroundTransparency = 1
+LblVoteStatus.Text = "Голосование: Не активно"
+LblVoteStatus.TextColor3 = Color3.fromRGB(150, 180, 210)
+LblVoteStatus.Font = Enum.Font.GothamSemibold
+LblVoteStatus.TextSize = 11
+LblVoteStatus.TextXAlignment = Enum.TextXAlignment.Left
+LblVoteStatus.ClipsDescendants = true
+LblVoteStatus.TextTruncate = Enum.TextTruncate.AtEnd
+LblVoteStatus.Parent = StateInfoFrame
+
+local LblLocalPlayerStatus = Instance.new("TextLabel")
+LblLocalPlayerStatus.Size = UDim2.new(1, -12, 0, 14)
+LblLocalPlayerStatus.Position = UDim2.new(0, 8, 0, 40)
+LblLocalPlayerStatus.BackgroundTransparency = 1
+LblLocalPlayerStatus.Text = "Игрок: Alive=false | HP: 100 | Роль: None"
+LblLocalPlayerStatus.TextColor3 = Color3.fromRGB(160, 240, 160)
+LblLocalPlayerStatus.Font = Enum.Font.Gotham
+LblLocalPlayerStatus.TextSize = 10
+LblLocalPlayerStatus.TextXAlignment = Enum.TextXAlignment.Left
+LblLocalPlayerStatus.Parent = StateInfoFrame
+
+-- Контейнер кнопок управления
+local ControlsFrame = Instance.new("Frame")
+ControlsFrame.Size = UDim2.new(1, -16, 0, 28)
+ControlsFrame.Position = UDim2.new(0, 8, 0, 98)
+ControlsFrame.BackgroundTransparency = 1
+ControlsFrame.Parent = MainFrame
+
+local function CreateButton(text: string, color: Color3, pos: UDim2, size: UDim2): TextButton
+    local btn = Instance.new("TextButton")
+    btn.Size = size
+    btn.Position = pos
+    btn.BackgroundColor3 = color
+    btn.Text = text
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.Parent = ControlsFrame
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+    return btn
+end
+
+local BtnExport = CreateButton("💾 ЭКСПОРТ ЛОГА (В ФАЙЛ)", Color3.fromRGB(40, 130, 200), UDim2.new(0, 0, 0, 0), UDim2.new(0.46, -2, 1, 0))
+local BtnCopy = CreateButton("📋 СКОПИРОВАТЬ", Color3.fromRGB(90, 60, 160), UDim2.new(0.46, 2, 0, 0), UDim2.new(0.36, -2, 1, 0))
+local BtnClear = CreateButton("🗑 ОЧИСТИТЬ", Color3.fromRGB(70, 70, 80), UDim2.new(0.82, 2, 0, 0), UDim2.new(0.18, -2, 1, 0))
+
+-- Консоль вывода событий
+local ConsoleFrame = Instance.new("Frame")
+ConsoleFrame.Size = UDim2.new(1, -16, 1, -136)
+ConsoleFrame.Position = UDim2.new(0, 8, 0, 130)
+ConsoleFrame.BackgroundColor3 = Color3.fromRGB(12, 13, 18)
+ConsoleFrame.BorderSizePixel = 0
+ConsoleFrame.Parent = MainFrame
+Instance.new("UICorner", ConsoleFrame).CornerRadius = UDim.new(0, 6)
+
+local ConsoleStroke = Instance.new("UIStroke", ConsoleFrame)
+ConsoleStroke.Color = Color3.fromRGB(35, 38, 52)
+ConsoleStroke.Thickness = 1
+
+local LogScroll = Instance.new("ScrollingFrame")
+LogScroll.Size = UDim2.new(1, -8, 1, -8)
+LogScroll.Position = UDim2.new(0, 4, 0, 4)
+LogScroll.BackgroundTransparency = 1
+LogScroll.BorderSizePixel = 0
+LogScroll.ScrollBarThickness = 4
+LogScroll.ScrollBarImageColor3 = Color3.fromRGB(90, 100, 130)
+LogScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+LogScroll.Parent = ConsoleFrame
+
+local LogLayout = Instance.new("UIListLayout")
+LogLayout.SortOrder = Enum.SortOrder.LayoutOrder
+LogLayout.Padding = UDim.new(0, 2)
+LogLayout.Parent = LogScroll
+
+local function SetLogsCollapsed(collapsed: boolean)
+    isLogsCollapsed = collapsed
+    ConsoleFrame.Visible = not collapsed
+    ToggleBtn.Text = collapsed and "▼" or "▲"
+    MainFrame.Size = UDim2.new(0, WINDOW_WIDTH, 0, collapsed and COLLAPSED_HEIGHT or EXPANDED_HEIGHT)
+end
+
+ToggleBtn.MouseButton1Click:Connect(function()
+    SetLogsCollapsed(not isLogsCollapsed)
+end)
+
+-- =====================================================================
+-- БОКОВАЯ ПАНЕЛЬ УЧАСТНИКОВ РАУНДА (СПРАВА)
+-- =====================================================================
+local PlayersSideFrame = Instance.new("Frame")
+PlayersSideFrame.Name = "PlayersSideFrame"
+PlayersSideFrame.Size = UDim2.new(0, 240, 1, 0)
+PlayersSideFrame.Position = UDim2.new(1, 8, 0, 0)
+PlayersSideFrame.BackgroundColor3 = Color3.fromRGB(16, 17, 24)
+PlayersSideFrame.BorderSizePixel = 0
+PlayersSideFrame.Visible = false
+PlayersSideFrame.Parent = MainFrame
+Instance.new("UICorner", PlayersSideFrame).CornerRadius = UDim.new(0, 10)
+
+local PlayersSideStroke = Instance.new("UIStroke", PlayersSideFrame)
+PlayersSideStroke.Color = Color3.fromRGB(50, 60, 85)
+PlayersSideStroke.Thickness = 1.2
+
+-- Заголовок панели игроков
+local PlayersTitleBar = Instance.new("Frame")
+PlayersTitleBar.Name = "PlayersTitleBar"
+PlayersTitleBar.Size = UDim2.new(1, 0, 0, 32)
+PlayersTitleBar.BackgroundColor3 = Color3.fromRGB(24, 26, 38)
+PlayersTitleBar.BorderSizePixel = 0
+PlayersTitleBar.Parent = PlayersSideFrame
+Instance.new("UICorner", PlayersTitleBar).CornerRadius = UDim.new(0, 10)
+
+local PlayersTitleLabel = Instance.new("TextLabel")
+PlayersTitleLabel.Size = UDim2.new(1, -36, 1, 0)
+PlayersTitleLabel.Position = UDim2.new(0, 10, 0, 0)
+PlayersTitleLabel.BackgroundTransparency = 1
+PlayersTitleLabel.Text = "👥 ИГРОКИ В РАУНДЕ"
+PlayersTitleLabel.TextColor3 = Color3.fromRGB(120, 220, 255)
+PlayersTitleLabel.Font = Enum.Font.GothamBold
+PlayersTitleLabel.TextSize = 11
+PlayersTitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+PlayersTitleLabel.Parent = PlayersTitleBar
+
+local PlayersCloseBtn = Instance.new("TextButton")
+PlayersCloseBtn.Size = UDim2.new(0, 22, 0, 22)
+PlayersCloseBtn.Position = UDim2.new(1, -27, 0, 5)
+PlayersCloseBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 60)
+PlayersCloseBtn.Text = "✕"
+PlayersCloseBtn.TextColor3 = Color3.new(1, 1, 1)
+PlayersCloseBtn.Font = Enum.Font.GothamBold
+PlayersCloseBtn.TextSize = 10
+PlayersCloseBtn.Parent = PlayersTitleBar
+Instance.new("UICorner", PlayersCloseBtn).CornerRadius = UDim.new(0, 5)
+
+-- Сводка (счетчик живых/всего)
+local PlayersSummaryFrame = Instance.new("Frame")
+PlayersSummaryFrame.Size = UDim2.new(1, -12, 0, 22)
+PlayersSummaryFrame.Position = UDim2.new(0, 6, 0, 36)
+PlayersSummaryFrame.BackgroundColor3 = Color3.fromRGB(22, 24, 34)
+PlayersSummaryFrame.BorderSizePixel = 0
+PlayersSummaryFrame.Parent = PlayersSideFrame
+Instance.new("UICorner", PlayersSummaryFrame).CornerRadius = UDim.new(0, 5)
+
+local LblPlayersSummary = Instance.new("TextLabel")
+LblPlayersSummary.Size = UDim2.new(1, -8, 1, 0)
+LblPlayersSummary.Position = UDim2.new(0, 4, 0, 0)
+LblPlayersSummary.BackgroundTransparency = 1
+LblPlayersSummary.Text = "В лобби: раунд не начат"
+LblPlayersSummary.TextColor3 = Color3.fromRGB(160, 160, 180)
+LblPlayersSummary.Font = Enum.Font.GothamSemibold
+LblPlayersSummary.TextSize = 10
+LblPlayersSummary.TextXAlignment = Enum.TextXAlignment.Center
+LblPlayersSummary.Parent = PlayersSummaryFrame
+
+-- Список игроков (ScrollingFrame)
+local PlayersScroll = Instance.new("ScrollingFrame")
+PlayersScroll.Size = UDim2.new(1, -12, 1, -66)
+PlayersScroll.Position = UDim2.new(0, 6, 0, 62)
+PlayersScroll.BackgroundTransparency = 1
+PlayersScroll.BorderSizePixel = 0
+PlayersScroll.ScrollBarThickness = 3
+PlayersScroll.ScrollBarImageColor3 = Color3.fromRGB(80, 95, 130)
+PlayersScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+PlayersScroll.Parent = PlayersSideFrame
+
+local PlayersLayout = Instance.new("UIListLayout")
+PlayersLayout.SortOrder = Enum.SortOrder.LayoutOrder
+PlayersLayout.Padding = UDim.new(0, 3)
+PlayersLayout.Parent = PlayersScroll
+
+local isPlayersPanelOpen = false
+local UpdatePlayersPanel: () -> () = function() end
+
+local function SetPlayersPanelOpen(open: boolean)
+    isPlayersPanelOpen = open
+    PlayersSideFrame.Visible = open
+    PlayersBtn.BackgroundColor3 = open and Color3.fromRGB(40, 120, 190) or Color3.fromRGB(45, 55, 80)
+    if open then
+        UpdatePlayersPanel()
+    end
+end
+
+PlayersBtn.MouseButton1Click:Connect(function()
+    SetPlayersPanelOpen(not isPlayersPanelOpen)
+end)
+
+PlayersCloseBtn.MouseButton1Click:Connect(function()
+    SetPlayersPanelOpen(false)
+end)
+
+-- =====================================================================
+-- СИСТЕМА ЛОГИРОВАНИЯ
+-- =====================================================================
+local logCounter = 0
+local rawLogLines: { string } = {}
+
+local function Log(message: string, msgCategory: string?)
+    if isTerminated then return end
+    logCounter = logCounter + 1
+
+    local color = Color3.fromRGB(200, 200, 200)
+    local prefix = "[INFO]"
+
+    if msgCategory == "ROUND" then
+        color = Color3.fromRGB(255, 110, 110)
+        prefix = "[ROUND]"
+    elseif msgCategory == "MAP" then
+        color = Color3.fromRGB(120, 200, 255)
+        prefix = "[MAP]"
+    elseif msgCategory == "COIN" then
+        color = Color3.fromRGB(255, 215, 60)
+        prefix = "[COIN]"
+    elseif msgCategory == "VOTE" then
+        color = Color3.fromRGB(170, 120, 255)
+        prefix = "[VOTE]"
+    elseif msgCategory == "REMOTE" then
+        color = Color3.fromRGB(255, 145, 50)
+        prefix = "[REMOTE]"
+    elseif msgCategory == "DATA" then
+        color = Color3.fromRGB(130, 255, 170)
+        prefix = "[DATA]"
+    elseif msgCategory == "KILL" then
+        color = Color3.fromRGB(255, 70, 180)
+        prefix = "[KILL]"
+    elseif msgCategory == "PLAYER" then
+        color = Color3.fromRGB(110, 255, 230)
+        prefix = "[PLAYER]"
+    elseif msgCategory == "WARN" then
+        color = Color3.fromRGB(255, 180, 50)
+        prefix = "[WARN]"
+    elseif msgCategory == "ERROR" then
+        color = Color3.fromRGB(255, 75, 75)
+        prefix = "[ERR]"
+    end
+
+    local timeStr = os.date("%H:%M:%S")
+    local lineText = string.format("%s %s %s", timeStr, prefix, message)
+    table.insert(rawLogLines, lineText)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -6, 0, 0)
+    lbl.AutomaticSize = Enum.AutomaticSize.Y
+    lbl.BackgroundTransparency = 1
+    lbl.Text = lineText
+    lbl.TextColor3 = color
+    lbl.Font = Enum.Font.Code
+    lbl.TextSize = 10
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextWrapped = true
+    lbl.LayoutOrder = logCounter
+    lbl.Parent = LogScroll
+
+    -- Авто-скролл вниз
+    task.defer(function()
+        LogScroll.CanvasPosition = Vector2.new(0, 999999)
+    end)
+end
+
+local function ClearLogs()
+    for _, child in ipairs(LogScroll:GetChildren()) do
+        if child:IsA("TextLabel") then child:Destroy() end
+    end
+    table.clear(rawLogLines)
+    logCounter = 0
+    Log("Логи очищены.", "INFO")
+end
+
+BtnClear.MouseButton1Click:Connect(ClearLogs)
+
+-- Экспорт лога в файл и буфер обмена
+local function ExportLogsToFile()
+    if #rawLogLines == 0 then
+        Log("Лог пуст — нечего экспортировать", "WARN")
+        return
+    end
+
+    local fileName = "mm2_round_diagnostic.txt"
+    local content = table.concat(rawLogLines, "\n")
+    local wf = writefile or (syn and syn.writefile)
+
+    if typeof(wf) == "function" then
+        local ok, err = pcall(wf, fileName, content)
+        if ok then
+            Log(string.format("✅ Лог записан в файл: %s (%d строк)", fileName, #rawLogLines), "DATA")
+        else
+            Log("❌ Ошибка записи файла: " .. tostring(err), "ERROR")
+        end
+    else
+        Log("⚠️ Функция writefile недоступна в этом эксплойте", "WARN")
+    end
+end
+
+local function CopyLogsToClipboard(sourceBtn: TextButton?): boolean
+    if #rawLogLines == 0 then
+        Log("Лог пуст — нечего копировать", "WARN")
+        return false
+    end
+    local content = table.concat(rawLogLines, "\n")
+    local sc = setclipboard or toclipboard or (syn and syn.write_clipboard) or (Clipboard and Clipboard.set)
+    local copied = false
+    if typeof(sc) == "function" then
+        local ok, err = pcall(sc, content)
+        if ok then
+            copied = true
+            Log(string.format("📋 Лог скопирован в буфер обмена (%d строк)", #rawLogLines), "DATA")
+        else
+            Log("❌ Ошибка буфера: " .. tostring(err), "ERROR")
+        end
+    else
+        Log("⚠️ Функция setclipboard недоступна в этом эксплойте", "WARN")
+    end
+
+    if sourceBtn then
+        local origText = sourceBtn.Text
+        local origBg = sourceBtn.BackgroundColor3
+        sourceBtn.Text = copied and (sourceBtn == CopyTitleBtn and "✅" or "✅ СКОПИРОВАНО!") or "⚠️ ОШИБКА"
+        sourceBtn.BackgroundColor3 = copied and Color3.fromRGB(40, 160, 80) or Color3.fromRGB(180, 60, 60)
+        task.delay(1.5, function()
+            if not isTerminated and sourceBtn and sourceBtn.Parent then
+                sourceBtn.Text = origText
+                sourceBtn.BackgroundColor3 = origBg
+            end
+        end)
+    end
+
+    return copied
+end
+
+local function BindButton(btn: TextButton, callback: () -> ())
+    local debounce = false
+    local function fire()
+        if debounce or isTerminated then return end
+        debounce = true
+        task.spawn(callback)
+        task.delay(0.2, function() debounce = false end)
+    end
+    btn.MouseButton1Click:Connect(fire)
+    btn.TouchTap:Connect(fire)
+end
+
+BindButton(BtnExport, ExportLogsToFile)
+BindButton(BtnCopy, function()
+    CopyLogsToClipboard(BtnCopy)
+end)
+BindButton(CopyTitleBtn, function()
+    CopyLogsToClipboard(CopyTitleBtn)
+end)
+
+-- =====================================================================
+-- СЕРИАЛИЗАТОР АРГУМЕНТОВ РЕМОУТОВ
+-- =====================================================================
+local function SerializeArg(v: any, depth: number?): string
+    depth = depth or 0
+    if depth > 2 then return "..." end
+    local t = typeof(v)
+    if t == "string" then
+        return '"' .. tostring(v):sub(1, 100) .. '"'
+    elseif t == "number" or t == "boolean" then
+        return tostring(v)
+    elseif t == "nil" then
+        return "nil"
+    elseif t == "Instance" then
+        local ok, path = pcall(function() return v:GetFullName() end)
+        return "[" .. v.ClassName .. "] " .. (ok and path or v.Name)
+    elseif t == "table" then
+        local parts = {}
+        local count = 0
+        for k, val in pairs(v) do
+            count = count + 1
+            if count > 8 then table.insert(parts, "..."); break end
+            table.insert(parts, tostring(k) .. "=" .. SerializeArg(val, depth + 1))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    else
+        return t .. "(" .. tostring(v):sub(1, 40) .. ")"
+    end
+end
+
+local function SerializeArgs(...): string
+    local n = select("#", ...)
+    if n == 0 then return "(без параметров)" end
+    local parts = {}
+    for i = 1, n do
+        local v = select(i, ...)
+        table.insert(parts, "#" .. i .. ": " .. SerializeArg(v))
+    end
+    return table.concat(parts, " | ")
+end
+
+-- =====================================================================
+-- ПОИСК REMOTEEVENT
+-- =====================================================================
+local function FindRemoteEvent(name: string): RemoteEvent?
+    local direct = ReplicatedStorage:FindFirstChild(name)
+    if direct and direct:IsA("RemoteEvent") then return direct end
+    local deep = ReplicatedStorage:FindFirstChild(name, true)
+    if deep and deep:IsA("RemoteEvent") then return deep end
+    for _, item in ipairs(ReplicatedStorage:GetDescendants()) do
+        if item:IsA("RemoteEvent") and item.Name == name then
+            return item
+        end
+    end
+    return nil
+end
+
+-- =====================================================================
+-- ТРЕКЕР СОСТОЯНИЯ: СЕТЕВЫЕ СОБЫТИЯ (REMOTES)
+-- =====================================================================
+local PlayerCoinsCache: { [string]: number } = {}
+local PlayerRolesCache: { [string]: string } = {}
+local PlayerAliveCache: { [string]: boolean } = {}
+local EndVoting: (reason: string?) -> () = function(_: string?) end
+local UpdateLocalPlayerDisplay: () -> () = function() end
+local ForceCheckMap: () -> () = function() end
+
+local function RegisterRemoteHook(name: string, callback: (...any) -> ())
+    local re = FindRemoteEvent(name)
+    if re then
+        local conn = re.OnClientEvent:Connect(function(...)
+            if isTerminated then return end
+            callback(...)
+        end)
+        table.insert(activeConnections, conn)
+        Log(string.format("📡 Перехватчик [%s] успешно подключен", name), "INFO")
+    else
+        Log(string.format("⚠️ RemoteEvent [%s] не найден в ReplicatedStorage", name), "WARN")
+    end
+end
+
+-- 1. RoleSelect: Выдача ролей
+RegisterRemoteHook("RoleSelect", function(...)
+    local role = select(1, ...)
+    Log(string.format("🎭 [RoleSelect] Выдана роль: %s | Параметры: %s", tostring(role), SerializeArgs(...)), "ROUND")
+    LblRoundStatus.Text = "Раунд: Выдача ролей (" .. tostring(role) .. ")"
+    LblRoundStatus.TextColor3 = Color3.fromRGB(100, 220, 255)
+    EndVoting("Выдача ролей (RoleSelect)")
+    ForceCheckMap()
+    if role then
+        PlayerRolesCache[LocalPlayer.Name] = tostring(role)
+        UpdateLocalPlayerDisplay()
+    end
+end)
+
+-- 2. RoundStart: Официальный старт раунда
+RegisterRemoteHook("RoundStart", function(...)
+    local duration = select(1, ...)
+    local playersData = select(2, ...)
+    Log(string.format("🚀 [RoundStart] Раунд официально НАЧАТ! Длительность: %s сек | Параметры: %s", tostring(duration), SerializeArgs(...)), "ROUND")
+    LblRoundStatus.Text = "Раунд: ИДЁТ (" .. tostring(duration) .. "с)"
+    LblRoundStatus.TextColor3 = Color3.fromRGB(100, 255, 120)
+    EndVoting("Старт раунда (RoundStart)")
+    ForceCheckMap()
+
+    if typeof(playersData) == "table" then
+        for pName, pInfo in pairs(playersData) do
+            if typeof(pInfo) == "table" then
+                local strName = tostring(pName)
+                if pInfo.Role ~= nil then PlayerRolesCache[strName] = tostring(pInfo.Role) end
+                if pInfo.Dead ~= nil then PlayerAliveCache[strName] = (pInfo.Dead == true) end
+                if pInfo.Coins ~= nil then PlayerCoinsCache[strName] = tonumber(pInfo.Coins) or 0 end
+            end
+        end
+        UpdateLocalPlayerDisplay()
+        UpdatePlayersPanel()
+    end
+end)
+
+-- 3. RoundEndFade: Завершение раунда сервером
+RegisterRemoteHook("RoundEndFade", function(...)
+    Log(string.format("🏁 [RoundEndFade] СЕРВЕР ОБЪЯВИЛ КОНЕЦ РАУНДА! Параметры: %s", SerializeArgs(...)), "ROUND")
+    LblRoundStatus.Text = "Раунд: ЗАВЕРШЁН (Конец)"
+    LblRoundStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
+    currentAssassinTarget = nil
+    UpdateLocalPlayerDisplay()
+    UpdatePlayersPanel()
+end)
+
+-- 4. ChangeTarget: Система таргетов Assassin
+local currentAssassinTarget: string? = nil
+
+RegisterRemoteHook("ChangeTarget", function(targetName: any, targetKnife: any, targetGun: any, targetUserId: any)
+    local tName = tostring(targetName)
+    local isNew = (tName ~= currentAssassinTarget)
+    currentAssassinTarget = tName
+
+    if isNew then
+        Log(string.format("🎯 [ChangeTarget: НОВАЯ ЦЕЛЬ] '%s' | Нож: %s | Оружие: %s | UserId: %s", 
+            tName, tostring(targetKnife), tostring(targetGun), tostring(targetUserId)), "ROUND")
+    else
+        Log(string.format("🎯 [ChangeTarget: ПОДТВЕРЖДЕНИЕ] Цель не изменилась: '%s' (сервер обновил таргеты после чьей-то смерти)", tName), "ROUND")
+    end
+end)
+
+-- 5. GiveWeapon: Сервер выдал оружие игроку
+RegisterRemoteHook("GiveWeapon", function(weaponName: any)
+    Log(string.format("🗡 [GiveWeapon] Сервер выдал оружие клиенту: '%s'", tostring(weaponName)), "ROUND")
+end)
+
+-- 6. KillEvent: Смерть участника
+RegisterRemoteHook("KillEvent", function(victimName: any, ...)
+    Log(string.format("💀 [KillEvent] Погиб игрок: '%s' | Доп. данные: %s", tostring(victimName), SerializeArgs(...)), "KILL")
+    if victimName then
+        PlayerAliveCache[tostring(victimName)] = true
+        UpdateLocalPlayerDisplay()
+        UpdatePlayersPanel()
+    end
+end)
+
+-- 7. SpecialXPEvent: Начисление опыта
+RegisterRemoteHook("SpecialXPEvent", function(reason: any, ...)
+    Log(string.format("⭐ [SpecialXPEvent] XP Событие: '%s'", tostring(reason)), "KILL")
+end)
+
+-- 8. PlayerDataChanged: Глобальная серверная таблица (Монеты ВСЕХ игроков, роли, статус жизни)
+-- MM2 рассылает ВСЕМ клиентам сводную таблицу игроков ПРИ ИГРОВЫХ СОБЫТИЯХ (смерти игроков)!
+RegisterRemoteHook("PlayerDataChanged", function(data: any)
+    if typeof(data) ~= "table" then
+        Log("[PlayerDataChanged] Получены данные не-табличного типа: " .. tostring(data), "DATA")
+        return
+    end
+
+    local countPlayers = 0
+    local coinDeltas = {}
+    local roleDeltas = {}
+    local deathDeltas = {}
+
+    for pName, pInfo in pairs(data) do
+        countPlayers = countPlayers + 1
+        local playerName = tostring(pName)
+
+        if typeof(pInfo) == "table" then
+            -- Монеты
+            if pInfo.Coins ~= nil then
+                local currentCoins = tonumber(pInfo.Coins) or 0
+                local prevCoins = PlayerCoinsCache[playerName]
+                if prevCoins ~= nil and currentCoins ~= prevCoins then
+                    local diff = currentCoins - prevCoins
+                    table.insert(coinDeltas, string.format("%s (%+d -> %d)", playerName, diff, currentCoins))
+                    if playerName == LocalPlayer.Name then
+                        Log(string.format("🎯 [МОЙ ИГРОК: PlayerData] Сервер обновил монеты: %+d (стало %d)", diff, currentCoins), "PLAYER")
+                    end
+                end
+                PlayerCoinsCache[playerName] = currentCoins
+            end
+
+            -- Роли
+            if pInfo.Role ~= nil then
+                local r = tostring(pInfo.Role)
+                local prevR = PlayerRolesCache[playerName]
+                if prevR ~= nil and r ~= prevR then
+                    table.insert(roleDeltas, string.format("%s: %s -> %s", playerName, prevR, r))
+                end
+                PlayerRolesCache[playerName] = r
+            end
+
+            -- Смерти (Dead)
+            if pInfo.Dead ~= nil then
+                local isDead = (pInfo.Dead == true)
+                local prevDead = PlayerAliveCache[playerName]
+                if prevDead ~= nil and isDead ~= prevDead then
+                    table.insert(deathDeltas, string.format("%s: %s", playerName, isDead and "МЁРТВ" or "ЖИВ"))
+                end
+                PlayerAliveCache[playerName] = isDead
+            end
+        end
+    end
+
+    if #coinDeltas > 0 then
+        Log("🪙 [PlayerData: МОНЕТЫ] " .. table.concat(coinDeltas, ", "), "COIN")
+    end
+    if #roleDeltas > 0 then
+        Log("🎭 [PlayerData: РОЛИ] " .. table.concat(roleDeltas, ", "), "DATA")
+    end
+    if #deathDeltas > 0 then
+        Log("⚰️ [PlayerData: СТАТУС] " .. table.concat(deathDeltas, ", "), "DATA")
+    end
+
+    UpdateLocalPlayerDisplay()
+    UpdatePlayersPanel()
+
+    -- Если пришёл пустой словарь {} — это сброс состояния между раундами!
+    if countPlayers == 0 then
+        Log("🔄 [PlayerDataChanged] Таблица игроков ОЧИЩЕНА сервером (Сброс между раундами)", "DATA")
+        table.clear(PlayerCoinsCache)
+        table.clear(PlayerRolesCache)
+        table.clear(PlayerAliveCache)
+        UpdateLocalPlayerDisplay()
+        UpdatePlayersPanel()
+    end
+end)
+
+-- =====================================================================
+-- ТРЕКЕР КАРТЫ И МОНЕТ В WORKSPACE
+-- =====================================================================
+local CurrentMapInstance: Instance? = nil
+local CurrentCoinContainer: Instance? = nil
+local coinSpawnTracked = false
+local mapSpawnTick = 0
+local currentCoinCount = 0
+
+local function CheckCoinContainerCoins(container: Instance): number
+    local count = 0
+    for _, desc in ipairs(container:GetDescendants()) do
+        if desc:IsA("TouchTransmitter") and desc.Parent and desc.Parent:IsA("BasePart") then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function HookCoinContainer(coinContainer: Instance)
+    if CurrentCoinContainer == coinContainer then return end
+    CurrentCoinContainer = coinContainer
+    currentCoinCount = CheckCoinContainerCoins(coinContainer)
+    if currentCoinCount > 0 then
+        coinSpawnTracked = true
+    end
+    LblCoinsInfo.Text = string.format("Монеты: %d на карте", currentCoinCount)
+
+    local spawnDelta = (mapSpawnTick > 0) and string.format("(через %.2fc после карты)", tick() - mapSpawnTick) or ""
+    Log(string.format("🟡 [CoinContainer] Обнаружен! Стартовое число монет: %d %s", currentCoinCount, spawnDelta), "COIN")
+
+    -- Отслеживаем добавление монет инкрементно (без O(N^2) обхода дерева)
+    local addConn = coinContainer.DescendantAdded:Connect(function(desc)
+        if desc:IsA("TouchTransmitter") then
+            currentCoinCount = currentCoinCount + 1
+            if not coinSpawnTracked then
+                coinSpawnTracked = true
+                local d = (mapSpawnTick > 0) and string.format("(через %.2fc после спавна карты)", tick() - mapSpawnTick) or ""
+                Log(string.format("✨ [МОНЕТЫ] НАЧАЛСЯ СПАВН МОНЕТ на карте! %s", d), "COIN")
+            end
+            LblCoinsInfo.Text = string.format("Монеты: %d на карте", currentCoinCount)
+        end
+    end)
+    table.insert(activeConnections, addConn)
+
+    -- Отслеживаем удаление монет (подбор) декрементно
+    local remConn = coinContainer.ChildRemoved:Connect(function()
+        currentCoinCount = math.max(0, currentCoinCount - 1)
+        LblCoinsInfo.Text = string.format("Монеты: %d на карте", currentCoinCount)
+    end)
+    table.insert(activeConnections, remConn)
+
+    -- Отслеживаем уничтожение контейнера (защита от дубликатов лога)
+    local ancConn = coinContainer.AncestryChanged:Connect(function(_, parent)
+        if not parent and CurrentCoinContainer == coinContainer then
+            CurrentCoinContainer = nil
+            currentCoinCount = 0
+            coinSpawnTracked = false
+            Log("❌ [CoinContainer] УДАЛЁН из Workspace!", "COIN")
+            LblCoinsInfo.Text = "Монеты: 0 (контейнер удален)"
+        end
+    end)
+    table.insert(activeConnections, ancConn)
+end
+
+local function IsMapCandidate(child: Instance): boolean
+    if not child:IsA("Model") and not child:IsA("Folder") then return false end
+    if child == LocalPlayer.Character or (child:IsA("Model") and Players:GetPlayerFromCharacter(child)) then return false end
+    if child.Name == "Lobby" or child.Name == "Terrain" or child.Name == "Camera" then return false end
+    if child.Name == "RaycastFilter" or child.Name == "GunDrop" then return false end
+    return true
+end
+
+local candidateConnections: { [Instance]: { RBXScriptConnection } } = {}
+
+local function DisconnectCandidate(child: Instance)
+    local conns = candidateConnections[child]
+    if conns then
+        for _, c in ipairs(conns) do
+            if c and c.Connected then pcall(function() c:Disconnect() end) end
+        end
+        candidateConnections[child] = nil
+    end
+end
+
+local function CleanupMap(child: Instance)
+    DisconnectCandidate(child)
+    if CurrentMapInstance == child then
+        local lifetime = (mapSpawnTick > 0) and string.format("(жила %.1fc)", tick() - mapSpawnTick) or ""
+        Log(string.format("🧹 [КАРТА] ОЧИСТКА КАРТЫ: '%s' удалена из Workspace %s", child.Name, lifetime), "MAP")
+        CurrentMapInstance = nil
+        CurrentCoinContainer = nil
+        currentCoinCount = 0
+        coinSpawnTracked = false
+        mapSpawnTick = 0
+        LblCurrentMap.Text = "Карта: (нет)"
+        LblCurrentMap.TextColor3 = Color3.fromRGB(180, 180, 180)
+        UpdateLocalPlayerDisplay()
+        UpdatePlayersPanel()
+    end
+end
+
+local function RegisterMap(child: Instance, spawns: Instance?, container: Instance?)
+    if CurrentMapInstance == child then return end
+    CurrentMapInstance = child
+    mapSpawnTick = tick()
+    coinSpawnTracked = false
+
+    LblCurrentMap.Text = "Карта: " .. child.Name
+    LblCurrentMap.TextColor3 = Color3.fromRGB(100, 255, 150)
+    LblRoundStatus.Text = "Раунд: ИДЁТ (Карта на сервере)"
+    LblRoundStatus.TextColor3 = Color3.fromRGB(100, 255, 120)
+
+    EndVoting("Спавн карты '" .. child.Name .. "'")
+    Log(string.format("🗺️ [КАРТА] СПАВН КАРТЫ: '%s' (Класс: %s, Spawns=%s, CoinContainer=%s)", 
+        child.Name, child.ClassName, tostring(spawns ~= nil), tostring(container ~= nil)), "MAP")
+
+    if container then
+        HookCoinContainer(container)
+    else
+        -- Ждем появления CoinContainer, если он загружается следом
+        local ccConn: RBXScriptConnection? = nil
+        ccConn = child.ChildAdded:Connect(function(newChild)
+            if newChild.Name == "CoinContainer" then
+                if ccConn then
+                    ccConn:Disconnect()
+                    ccConn = nil
+                end
+                HookCoinContainer(newChild)
+            end
+        end)
+        if ccConn then table.insert(activeConnections, ccConn) end
+
+        -- Дополнительный фоновый WaitForChild на случай задержки сетевой репликации
+        task.spawn(function()
+            local cc = child:WaitForChild("CoinContainer", 15)
+            if cc and not CurrentCoinContainer and CurrentMapInstance == child then
+                HookCoinContainer(cc)
+            end
+        end)
+    end
+
+    local remConn = child.AncestryChanged:Connect(function(_, parent)
+        if not parent or parent ~= Workspace then
+            CleanupMap(child)
+        end
+    end)
+    table.insert(activeConnections, remConn)
+end
+
+local function InspectMapCandidate(child: Instance)
+    if not IsMapCandidate(child) then return end
+    if CurrentMapInstance == child then return end
+
+    local container = child:FindFirstChild("CoinContainer")
+    local spawns = child:FindFirstChild("Spawns")
+
+    if container or spawns then
+        DisconnectCandidate(child)
+        RegisterMap(child, spawns, container)
+        return
+    end
+
+    -- Если папки Spawns/CoinContainer ещё реплицируются по сети:
+    -- Подключаем мгновенный слушатель ChildAdded на модель-кандидат (без жесткого ограничения по времени)
+    if not candidateConnections[child] then
+        candidateConnections[child] = {}
+
+        local addConn = child.ChildAdded:Connect(function(newChild)
+            if newChild.Name == "Spawns" or newChild.Name == "CoinContainer" then
+                DisconnectCandidate(child)
+                if not isTerminated and child.Parent == Workspace and CurrentMapInstance ~= child then
+                    local s = (newChild.Name == "Spawns") and newChild or child:FindFirstChild("Spawns")
+                    local c = (newChild.Name == "CoinContainer") and newChild or child:FindFirstChild("CoinContainer")
+                    RegisterMap(child, s, c)
+                end
+            end
+        end)
+        table.insert(candidateConnections[child], addConn)
+        table.insert(activeConnections, addConn)
+
+        local ancConn = child.AncestryChanged:Connect(function(_, parent)
+            if not parent or parent ~= Workspace then
+                DisconnectCandidate(child)
+            end
+        end)
+        table.insert(candidateConnections[child], ancConn)
+        table.insert(activeConnections, ancConn)
+
+        -- Фоновое ожидание с увеличенным до 15 сек таймаутом на случай задержки сетевых пакетов
+        task.spawn(function()
+            local foundSpawns = child:WaitForChild("Spawns", 15)
+            local foundContainer = child:FindFirstChild("CoinContainer")
+            if not isTerminated and child.Parent == Workspace and (foundSpawns or foundContainer) then
+                DisconnectCandidate(child)
+                if CurrentMapInstance ~= child then
+                    RegisterMap(child, foundSpawns, foundContainer)
+                end
+            end
+        end)
+    end
+end
+
+local function DoForceCheckMap()
+    if CurrentMapInstance and CurrentMapInstance.Parent == Workspace then return end
+    for _, ch in ipairs(Workspace:GetChildren()) do
+        if IsMapCandidate(ch) and CurrentMapInstance ~= ch then
+            InspectMapCandidate(ch)
+            if CurrentMapInstance then break end
+            -- Резерв: если раунд начат, а Spawns/CoinContainer ещё задерживаются,
+            -- любая модель-кандидат с деталями гарантированно является активной картой
+            if not CurrentMapInstance and ch:IsA("Model") and #ch:GetChildren() > 5 then
+                RegisterMap(ch, ch:FindFirstChild("Spawns"), ch:FindFirstChild("CoinContainer"))
+                break
+            end
+        end
+    end
+end
+ForceCheckMap = DoForceCheckMap
+
+-- Моментальная O(1) проверка карты: не сканируем Workspace:GetChildren() каждые 0.5с
+local function GetWorkspaceMap(): Instance?
+    if CurrentMapInstance and CurrentMapInstance.Parent == Workspace then
+        return CurrentMapInstance
+    end
+    return nil
+end
+
+-- =====================================================================
+-- УНИВЕРСАЛЬНАЯ ПРОВЕРКА НАХОЖДЕНИЯ В РАУНДЕ
+-- =====================================================================
+local function IsPlayerAliveInRound(plr: Player?): boolean
+    local player = plr or LocalPlayer
+    -- 1. Карта раунда должна быть в Workspace (не в лобби)
+    if not GetWorkspaceMap() then return false end
+
+    -- 2. Физический персонаж должен существовать и иметь здоровье
+    local char = player.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+
+    -- 3. Серверная проверка: игрок участник раунда и не мертв
+    if PlayerAliveCache[player.Name] == false then
+        return true
+    end
+
+    -- Резерв для классических режимов
+    return player:GetAttribute("Alive") == true
+end
+
+-- Сканируем уже существующие карты в Workspace при запуске
+for _, ch in ipairs(Workspace:GetChildren()) do
+    InspectMapCandidate(ch)
+end
+
+-- Слушаем появление новых карт
+local wsAddConn = Workspace.ChildAdded:Connect(function(child)
+    if isTerminated then return end
+    task.defer(function()
+        InspectMapCandidate(child)
+    end)
+end)
+table.insert(activeConnections, wsAddConn)
+
+-- Слушаем удаление карты из Workspace
+local wsRemConn = Workspace.ChildRemoved:Connect(function(child)
+    CleanupMap(child)
+end)
+table.insert(activeConnections, wsRemConn)
+
+-- =====================================================================
+-- ТРЕКЕР ГОЛОСОВАНИЯ (LOBBY VOTEPADS)
+-- =====================================================================
+local isVotingActive = false
+local lastVoteOptions = ""
+
+local function DoEndVoting(reason: string?)
+    if isVotingActive then
+        isVotingActive = false
+        lastVoteOptions = ""
+        local reasonMsg = reason and (" Причина: " .. reason) or ""
+        Log(string.format("🏁 [ГОЛОСОВАНИЕ] ГОЛОСОВАНИЕ ЗАВЕРШЕНО!%s", reasonMsg), "VOTE")
+        LblVoteStatus.Text = "Голосование: Не активно"
+        LblVoteStatus.TextColor3 = Color3.fromRGB(150, 180, 210)
+    end
+end
+EndVoting = DoEndVoting
+
+-- Кэш GUI и TextLabel для подиумов голосования (чтобы избежать рекурсивного сканирования каждые 0.5с)
+type PadCacheEntry = {
+    gui: Instance?,
+    textLabels: { TextLabel },
+}
+local padCache: { [Instance]: PadCacheEntry } = {}
+
+-- Проверка активности подиума голосования и извлечение данных с диагностикой метода скрытия
+local function GetPadVoteInfo(pad: Instance): (string?, number?, string)
+    local cached = padCache[pad]
+    local infoGui = cached and cached.gui
+
+    if not infoGui or not infoGui.Parent then
+        infoGui = pad:FindFirstChild("VoteInfoGui", true)
+        if not infoGui then
+            return nil, 0, "VoteInfoGui удалён (nil)"
+        end
+        local labels: { TextLabel } = {}
+        for _, desc in ipairs(infoGui:GetDescendants()) do
+            if desc:IsA("TextLabel") then
+                table.insert(labels, desc)
+            end
+        end
+        cached = {
+            gui = infoGui,
+            textLabels = labels,
+        }
+        padCache[pad] = cached
+    end
+
+    -- 1. Свойство Enabled у SurfaceGui/BillboardGui
+    if (infoGui:IsA("SurfaceGui") or infoGui:IsA("BillboardGui") or infoGui:IsA("ScreenGui")) and not (infoGui :: any).Enabled then
+        return nil, 0, "VoteInfoGui.Enabled = false"
+    end
+
+    local mapName: string? = nil
+    local votes = 0
+    local anyTextLabelFound = false
+    local hiddenReason = "Нет видимых TextLabel"
+
+    for _, desc in ipairs(cached.textLabels) do
+        if desc.Parent then
+            anyTextLabelFound = true
+
+            if not desc.Visible then
+                hiddenReason = string.format("TextLabel '%s'.Visible = false", desc.Name)
+            elseif desc.TextTransparency >= 1 then
+                hiddenReason = string.format("TextLabel '%s'.TextTransparency = 1", desc.Name)
+            else
+                -- Проверяем видимость родительских контейнеров (Frame, CanvasGroup)
+                local isParentVisible = true
+                local parent = desc.Parent
+                while parent and parent ~= infoGui do
+                    if parent:IsA("GuiObject") then
+                        if not parent.Visible then
+                            isParentVisible = false
+                            hiddenReason = string.format("Родитель '%s' (%s).Visible = false", parent.Name, parent.ClassName)
+                            break
+                        end
+                        if parent:IsA("CanvasGroup") and (parent :: CanvasGroup).GroupTransparency >= 1 then
+                            isParentVisible = false
+                            hiddenReason = string.format("CanvasGroup '%s'.GroupTransparency = 1", parent.Name)
+                            break
+                        end
+                    end
+                    parent = parent.Parent
+                end
+
+                if isParentVisible then
+                    local cleanText = string.gsub(desc.Text, "^%s*(.-)%s*$", "%1")
+                    local lower = string.lower(cleanText)
+                    if cleanText ~= "" and lower ~= "label" then
+                        if string.find(lower, "votes") then
+                            local num = tonumber(string.match(cleanText, "%d+"))
+                            if num then votes = num end
+                        else
+                            if desc.Name == "MapName" or not mapName then
+                                mapName = cleanText
+                            end
+                        end
+                    else
+                        hiddenReason = string.format("TextLabel '%s'.Text пустой", desc.Name)
+                    end
+                end
+            end
+        end
+    end
+
+    if mapName and mapName ~= "" then
+        return mapName, votes, "Активен"
+    end
+
+    if not anyTextLabelFound then
+        hiddenReason = "Внутри VoteInfoGui нет TextLabel"
+    end
+
+    return nil, 0, hiddenReason
+end
+
+local hookedPads: { [Instance]: boolean } = {}
+
+local function HookVotePadEvents(pad: Instance, onStateChange: () -> ())
+    if hookedPads[pad] then return end
+    hookedPads[pad] = true
+
+    local function TryHookGui(infoGui: Instance)
+        if infoGui:IsA("SurfaceGui") or infoGui:IsA("BillboardGui") or infoGui:IsA("ScreenGui") then
+            local conn = (infoGui :: any):GetPropertyChangedSignal("Enabled"):Connect(function()
+                if not isTerminated then
+                    onStateChange()
+                end
+            end)
+            table.insert(activeConnections, conn)
+        end
+    end
+
+    local existingGui = pad:FindFirstChild("VoteInfoGui", true)
+    if existingGui then
+        TryHookGui(existingGui)
+    end
+
+    local descConn = pad.DescendantAdded:Connect(function(desc)
+        if desc.Name == "VoteInfoGui" then
+            padCache[pad] = nil
+            TryHookGui(desc)
+            onStateChange()
+        elseif desc:IsA("TextLabel") then
+            padCache[pad] = nil
+        end
+    end)
+    table.insert(activeConnections, descConn)
+end
+
+local function CheckVotingState()
+    -- 1. Если в Workspace есть карта — голосование НЕ активно в любом случае
+    local currentMap = GetWorkspaceMap()
+    if currentMap ~= nil then
+        if isVotingActive then
+            EndVoting("В Workspace активна карта '" .. currentMap.Name .. "'")
+        else
+            if LblVoteStatus.Text ~= "Голосование: Не активно" then
+                LblVoteStatus.Text = "Голосование: Не активно"
+                LblVoteStatus.TextColor3 = Color3.fromRGB(150, 180, 210)
+            end
+        end
+        return
+    end
+
+    -- 2. Карты в Workspace нет — проверяем лобби и VotePads
+    local lobby = Workspace:FindFirstChild("Lobby")
+    local votePadsFolder = lobby and lobby:FindFirstChild("VotePads")
+
+    if not votePadsFolder then
+        if isVotingActive then
+            EndVoting("VotePads не найдены в лобби")
+        end
+        return
+    end
+
+    local currentMapNames = {}
+    local totalVotes = 0
+    local padReasons = {}
+
+    for _, pad in ipairs(votePadsFolder:GetChildren()) do
+        if pad:IsA("BasePart") or pad:IsA("Model") then
+            HookVotePadEvents(pad, CheckVotingState)
+            local mapName, votes, reason = GetPadVoteInfo(pad)
+            if mapName and mapName ~= "" then
+                table.insert(currentMapNames, string.format("%s (%d гол.)", mapName, votes))
+                totalVotes = totalVotes + votes
+            else
+                table.insert(padReasons, pad.Name .. ": " .. reason)
+            end
+        end
+    end
+
+    if #currentMapNames > 0 then
+        table.sort(currentMapNames)
+        local optionsStr = table.concat(currentMapNames, " | ")
+
+        if not isVotingActive or optionsStr ~= lastVoteOptions then
+            if not isVotingActive then
+                Log(string.format("🗳️ [ГОЛОСОВАНИЕ] НАЧАЛОСЬ ГОЛОСОВАНИЕ ЗА КАРТЫ! Варианты: %s", optionsStr), "VOTE")
+            else
+                Log(string.format("🗳️ [ГОЛОСОВАНИЕ: ОБНОВЛЕНИЕ] %s (Всего голосов: %d)", optionsStr, totalVotes), "VOTE")
+            end
+            isVotingActive = true
+            lastVoteOptions = optionsStr
+            LblVoteStatus.Text = "Голосование: " .. optionsStr
+            LblVoteStatus.TextColor3 = Color3.fromRGB(180, 120, 255)
+            if LblRoundStatus.Text == "Раунд: Ожидание" or string.find(LblRoundStatus.Text, "ЗАВЕРШЁН") then
+                LblRoundStatus.Text = "Раунд: Голосование"
+                LblRoundStatus.TextColor3 = Color3.fromRGB(200, 140, 255)
+            end
+        end
+    else
+        if isVotingActive then
+            local uniqueMethods = {}
+            local seenMethods = {}
+            for _, r in ipairs(padReasons) do
+                local method = string.match(r, ": (.*)$") or r
+                if not seenMethods[method] then
+                    seenMethods[method] = true
+                    table.insert(uniqueMethods, method)
+                end
+            end
+            local methodSummary = #uniqueMethods > 0 and table.concat(uniqueMethods, " | ") or "VoteInfoGui отключен"
+            EndVoting(string.format("Панели скрыты сервером [Метод: %s]", methodSummary))
+        end
+    end
+end
+
+-- Запуск проверки голосования: первичная проверка сразу при старте и поллинг каждые 0.5с
+task.spawn(function()
+    CheckVotingState()
+    while not isTerminated do
+        task.wait(0.5)
+        CheckVotingState()
+    end
+end)
+
+-- =====================================================================
+-- ТРЕКЕР СОСТОЯНИЯ LOCALPLAYER (Атрибуты, здоровье, спавн)
+-- =====================================================================
+local function DoUpdateLocalPlayerDisplay()
+    local isAlive = LocalPlayer:GetAttribute("Alive") == true
+    local isElite = LocalPlayer:GetAttribute("Elite") == true
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hp = hum and math.floor(hum.Health) or 0
+    local myRole = PlayerRolesCache[LocalPlayer.Name] or "None"
+    local myCoins = PlayerCoinsCache[LocalPlayer.Name] or 0
+    local isDeadServer = PlayerAliveCache[LocalPlayer.Name]
+    local serverDeadStr = isDeadServer == nil and "?" or tostring(isDeadServer)
+    local inRoundAlive = IsPlayerAliveInRound(LocalPlayer)
+
+    LblLocalPlayerStatus.Text = string.format("Игрок: ВРаунде=%s | Alive=%s | Dead=%s | HP:%d | %s | 🪙%d", 
+        tostring(inRoundAlive), tostring(isAlive), serverDeadStr, hp, myRole, myCoins)
+end
+UpdateLocalPlayerDisplay = DoUpdateLocalPlayerDisplay
+
+type PlayerCardUI = {
+    card: Frame,
+    stroke: UIStroke,
+    statusIcon: TextLabel,
+    nameLabel: TextLabel,
+    subLabel: TextLabel,
+}
+local playerCardPool: { [string]: PlayerCardUI } = {}
+
+local function DoUpdatePlayersPanel()
+    if not PlayersSideFrame.Visible then return end
+
+    local totalInRound = 0
+    local aliveCount = 0
+    local deadCount = 0
+
+    local participantNames = {}
+    for pName, _ in pairs(PlayerAliveCache) do
+        table.insert(participantNames, pName)
+    end
+
+    if #participantNames == 0 then
+        LblPlayersSummary.Text = "В лобби: раунд не начат"
+        LblPlayersSummary.TextColor3 = Color3.fromRGB(160, 160, 180)
+        for _, item in pairs(playerCardPool) do
+            item.card.Visible = false
+        end
+        return
+    end
+
+    -- Сортировка: сначала живые, затем мертвые; LocalPlayer всегда первый
+    table.sort(participantNames, function(a, b)
+        if a == LocalPlayer.Name then return true end
+        if b == LocalPlayer.Name then return false end
+        local aDead = PlayerAliveCache[a] == true
+        local bDead = PlayerAliveCache[b] == true
+        if aDead ~= bDead then
+            return not aDead
+        end
+        return string.lower(a) < string.lower(b)
+    end)
+
+    local activeNames: { [string]: boolean } = {}
+
+    for idx, pName in ipairs(participantNames) do
+        activeNames[pName] = true
+        totalInRound = totalInRound + 1
+        local isDead = PlayerAliveCache[pName] == true
+        if isDead then
+            deadCount = deadCount + 1
+        else
+            aliveCount = aliveCount + 1
+        end
+
+        local role = PlayerRolesCache[pName] or "None"
+        local coins = PlayerCoinsCache[pName] or 0
+        local isMe = (pName == LocalPlayer.Name)
+
+        local item = playerCardPool[pName]
+        if not item or not item.card.Parent then
+            local card = Instance.new("Frame")
+            card.Size = UDim2.new(1, -4, 0, 32)
+            card.BorderSizePixel = 0
+            Instance.new("UICorner", card).CornerRadius = UDim.new(0, 5)
+
+            local stroke = Instance.new("UIStroke", card)
+            stroke.Thickness = 1
+
+            local statusIcon = Instance.new("TextLabel")
+            statusIcon.Size = UDim2.new(0, 18, 1, 0)
+            statusIcon.Position = UDim2.new(0, 4, 0, 0)
+            statusIcon.BackgroundTransparency = 1
+            statusIcon.TextSize = 11
+            statusIcon.Parent = card
+
+            local nameLabel = Instance.new("TextLabel")
+            nameLabel.Size = UDim2.new(1, -26, 0, 14)
+            nameLabel.Position = UDim2.new(0, 24, 0, 2)
+            nameLabel.BackgroundTransparency = 1
+            nameLabel.Font = Enum.Font.GothamBold
+            nameLabel.TextSize = 10
+            nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+            nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            nameLabel.Parent = card
+
+            local subLabel = Instance.new("TextLabel")
+            subLabel.Size = UDim2.new(1, -26, 0, 12)
+            subLabel.Position = UDim2.new(0, 24, 0, 16)
+            subLabel.BackgroundTransparency = 1
+            subLabel.Font = Enum.Font.Gotham
+            subLabel.TextSize = 9
+            subLabel.TextXAlignment = Enum.TextXAlignment.Left
+            subLabel.Parent = card
+
+            card.Parent = PlayersScroll
+
+            item = {
+                card = card,
+                stroke = stroke,
+                statusIcon = statusIcon,
+                nameLabel = nameLabel,
+                subLabel = subLabel,
+            }
+            playerCardPool[pName] = item
+        end
+
+        item.card.Visible = true
+        item.card.LayoutOrder = idx
+        item.card.BackgroundColor3 = isMe and Color3.fromRGB(24, 38, 52) or Color3.fromRGB(20, 22, 30)
+        item.stroke.Color = isMe and Color3.fromRGB(60, 140, 200) or (isDead and Color3.fromRGB(50, 40, 45) or Color3.fromRGB(45, 65, 50))
+
+        item.statusIcon.Text = isDead and "💀" or "🟢"
+        item.nameLabel.Text = pName .. (isMe and " (ВЫ)" or "")
+        item.nameLabel.TextColor3 = isDead and Color3.fromRGB(150, 150, 150) or (isMe and Color3.fromRGB(100, 220, 255) or Color3.fromRGB(235, 235, 245))
+
+        local roleColor = Color3.fromRGB(170, 170, 180)
+        if role == "Murderer" or role == "Zombie" then
+            roleColor = Color3.fromRGB(255, 90, 90)
+        elseif role == "Sheriff" or role == "Hero" then
+            roleColor = Color3.fromRGB(90, 160, 255)
+        elseif role == "Assassin" then
+            roleColor = Color3.fromRGB(255, 170, 70)
+        elseif role == "Survivor" or role == "Innocent" then
+            roleColor = Color3.fromRGB(100, 230, 130)
+        end
+
+        item.subLabel.Text = string.format("%s | 🪙 %d", role, coins)
+        item.subLabel.TextColor3 = roleColor
+    end
+
+    -- Скрываем карточки тех, кого больше нет в раунде
+    for pName, item in pairs(playerCardPool) do
+        if not activeNames[pName] then
+            item.card.Visible = false
+        end
+    end
+
+    LblPlayersSummary.Text = string.format("Живых: %d | Погибло: %d | Всего: %d", aliveCount, deadCount, totalInRound)
+    LblPlayersSummary.TextColor3 = aliveCount > 0 and Color3.fromRGB(100, 255, 150) or Color3.fromRGB(255, 100, 100)
+end
+UpdatePlayersPanel = DoUpdatePlayersPanel
+
+local attrConn = LocalPlayer.AttributeChanged:Connect(function(attrName)
+    local val = LocalPlayer:GetAttribute(attrName)
+    Log(string.format("👤 [ИГРОК: АТРИБУТ] LocalPlayer изменил атрибут '%s' = %s", attrName, tostring(val)), "PLAYER")
+    UpdateLocalPlayerDisplay()
+end)
+table.insert(activeConnections, attrConn)
+
+local charRemConn = LocalPlayer.CharacterRemoving:Connect(function()
+    Log("💀 [ИГРОК] Персонаж удаляется из игры (Смерть / Сброс / Респавн)", "PLAYER")
+    UpdateLocalPlayerDisplay()
+end)
+table.insert(activeConnections, charRemConn)
+
+local charAddConn = LocalPlayer.CharacterAdded:Connect(function(newChar)
+    Log("✨ [ИГРОК] Заспавнился новый Character LocalPlayer", "PLAYER")
+    task.wait(0.2)
+    UpdateLocalPlayerDisplay()
+
+    local hum = newChar:WaitForChild("Humanoid", 5)
+    if hum and hum:IsA("Humanoid") then
+        local dConn = hum.Died:Connect(function()
+            Log("☠️ [ИГРОК] Humanoid.Died сработал у LocalPlayer!", "PLAYER")
+            UpdateLocalPlayerDisplay()
+        end)
+        table.insert(activeConnections, dConn)
+    end
+end)
+table.insert(activeConnections, charAddConn)
+
+-- Инициализация Humanoid текущего персонажа
+if LocalPlayer.Character then
+    local curHum = LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+    if curHum then
+        local dConn = curHum.Died:Connect(function()
+            Log("☠️ [ИГРОК] Humanoid.Died сработал у LocalPlayer!", "PLAYER")
+            UpdateLocalPlayerDisplay()
+        end)
+        table.insert(activeConnections, dConn)
+    end
+end
+UpdateLocalPlayerDisplay()
+
+-- =====================================================================
+-- ДИАГНОСТИКА ВЫБОРА УСТРОЙСТВА (DEVICE SELECT DIAGNOSTIC)
+-- =====================================================================
+local function InspectDeviceButton(btnInstance: Instance, name: string)
+    Log(string.format("🔍 [DEVICE] Обнаружена кнопка [%s]: класс = %s", name, btnInstance.ClassName), "DATA")
+    
+    if btnInstance:IsA("GuiObject") then
+        local absPos = btnInstance.AbsolutePosition
+        local absSize = btnInstance.AbsoluteSize
+        Log(string.format("📐 [%s] Visible: %s | Active: %s | AbsolutePos: (%d, %d) | AbsoluteSize: (%d, %d)", 
+            name, tostring(btnInstance.Visible), tostring(btnInstance.Active), absPos.X, absPos.Y, absSize.X, absSize.Y), "DATA")
+    end
+
+    -- Проверка getconnections на различные события
+    local gc = getconnections or (syn and syn.getconnections)
+    if typeof(gc) == "function" then
+        local eventsToCheck = {"MouseButton1Click", "MouseButton1Down", "Activated", "TouchTap", "InputBegan"}
+        for _, evName in ipairs(eventsToCheck) do
+            local hasSignal, signal = pcall(function() return (btnInstance :: any)[evName] end)
+            if hasSignal and signal then
+                local ok, conns = pcall(gc, signal)
+                if ok and typeof(conns) == "table" then
+                    Log(string.format("⚡ [%s.%s] Слушателей (listeners): %d", name, evName, #conns), #conns > 0 and "DATA" or "INFO")
+                end
+            end
+        end
+    else
+        Log(string.format("⚠️ [DEVICE] getconnections недоступен в эксплойте", name), "WARN")
+    end
+
+    -- Список дочерних элементов (Icon, Title, Switch, Last и т.д.)
+    local childrenDesc = {}
+    for _, ch in ipairs(btnInstance:GetChildren()) do
+        local extra = ""
+        if ch:IsA("TextLabel") or ch:IsA("TextButton") then
+            extra = string.format(" [Text: '%s', Vis: %s]", ch.Text, tostring(ch.Visible))
+        elseif ch:IsA("ImageLabel") or ch:IsA("ImageButton") then
+            extra = string.format(" [Image: '%s', Vis: %s]", ch.Image, tostring(ch.Visible))
+        end
+        table.insert(childrenDesc, string.format("%s (%s)%s", ch.Name, ch.ClassName, extra))
+    end
+    if #childrenDesc > 0 then
+        Log(string.format("📁 [%s] Дети: %s", name, table.concat(childrenDesc, ", ")), "INFO")
+    end
+
+    -- Слушаем нажатия пользователя на эту кнопку
+    if btnInstance:IsA("GuiObject") then
+        local inpConn = btnInstance.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                Log(string.format("👆 [DEVICE CLICK] Физическое нажатие на [%s]! UserInputType: %s", name, tostring(input.UserInputType.Name)), "DATA")
+            end
+        end)
+        table.insert(activeConnections, inpConn)
+    end
+end
+
+local function InspectDeviceSelectGui(gui: Instance)
+    Log(string.format("📱 [DEVICE] Найден интерфейс выбора устройства: %s (%s)", gui.Name, gui.ClassName), "DATA")
+    
+    local container = gui:FindFirstChild("Container")
+    if not container then
+        Log("⚠️ [DEVICE] 'Container' не найден внутри DeviceSelect. Ищем детей...", "WARN")
+        for _, ch in ipairs(gui:GetChildren()) do
+            Log(string.format("  • %s (%s)", ch.Name, ch.ClassName), "INFO")
+        end
+        return
+    end
+
+    Log(string.format("📦 [DEVICE] Container найден (класс: %s, Visible: %s)", container.ClassName, tostring((container :: any).Visible)), "DATA")
+    
+    local tablet = container:FindFirstChild("Tablet")
+    local phone = container:FindFirstChild("Phone")
+    
+    if tablet then
+        InspectDeviceButton(tablet, "Tablet")
+    else
+        Log("⚠️ [DEVICE] Кнопка Tablet не найдена в Container", "WARN")
+    end
+    
+    if phone then
+        InspectDeviceButton(phone, "Phone")
+    else
+        Log("⚠️ [DEVICE] Кнопка Phone не найдена в Container", "WARN")
+    end
+
+    -- Авто-тест попытки выбора через 2 секунды (если GUI все еще на экране)
+    task.delay(2, function()
+        if isTerminated or not gui.Parent then return end
+        Log("🧪 [DEVICE TEST] Пробуем автоматический выбор 'Tablet'...", "WARN")
+        
+        local targetBtn = tablet or phone
+        if not targetBtn then return end
+
+        local targetName = targetBtn.Name
+        local gc = getconnections or (syn and syn.getconnections)
+
+        -- Метод 1: getconnections на Activated / MouseButton1Click
+        if typeof(gc) == "function" then
+            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
+                local sOk, sig = pcall(function() return (targetBtn :: any)[evName] end)
+                if sOk and sig then
+                    local cOk, conns = pcall(gc, sig)
+                    if cOk and typeof(conns) == "table" and #conns > 0 then
+                        Log(string.format("⚡ [TEST 1] Вызываем %d слушателей %s.%s:Fire()...", #conns, targetName, evName), "INFO")
+                        for _, c in ipairs(conns) do
+                            pcall(function() c:Fire() end)
+                        end
+                    end
+                end
+            end
+        end
+
+        -- Метод 2: firesignal (если доступно)
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            pcall(function()
+                if (targetBtn :: any).Activated then
+                    fs((targetBtn :: any).Activated)
+                    Log("⚡ [TEST 2] Вызван firesignal(Activated)", "INFO")
+                end
+                if (targetBtn :: any).MouseButton1Click then
+                    fs((targetBtn :: any).MouseButton1Click)
+                    Log("⚡ [TEST 2] Вызван firesignal(MouseButton1Click)", "INFO")
+                end
+            end)
+        end
+
+        -- Метод 3: VirtualInputManager (клик по AbsolutePosition)
+        if targetBtn:IsA("GuiObject") then
+            local vim = game:GetService("VirtualInputManager")
+            local absPos = targetBtn.AbsolutePosition
+            local absSize = targetBtn.AbsoluteSize
+            local cx = absPos.X + absSize.X / 2
+            local cy = absPos.Y + absSize.Y / 2
+            pcall(function()
+                Log(string.format("🖱 [TEST 3] Эмуляция клика VirtualInputManager по (%d, %d)...", cx, cy), "INFO")
+                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
+                task.wait(0.05)
+                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
+            end)
+        end
+
+        -- Проверка результата через 1 секунду
+        task.wait(1)
+        if not gui.Parent or not (gui:IsA("ScreenGui") and gui.Enabled) or not (container:IsA("GuiObject") and container.Visible) then
+            Log("🎉 [DEVICE TEST РЕЗУЛЬТАТ] Меню выбора УСПЕШНО закрылось! Автовыбор работает!", "DATA")
+        else
+            Log("ℹ️ [DEVICE TEST РЕЗУЛЬТАТ] Меню все еще открыто. Нажмите на Tablet/Phone вручную — клик и сетевые запросы будут записаны.", "WARN")
+        end
+    end)
+end
+
+-- Перехват исходящих сетевых запросов (FireServer / InvokeServer)
+if typeof(hookmetamethod) == "function" then
+    local oldNamecall
+    local hookOk, hookErr = pcall(function()
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if not isTerminated and (method == "FireServer" or method == "InvokeServer") then
+                local remoteName = tostring(self.Name)
+                local lower = string.lower(remoteName)
+                local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                local hasDevSelect = playerGui and playerGui:FindFirstChild("DeviceSelect") ~= nil
+                
+                if hasDevSelect or string.find(lower, "device") or string.find(lower, "select") or string.find(lower, "platform") or string.find(lower, "tablet") or string.find(lower, "phone") then
+                    Log(string.format("📤 [REMOTECALL] %s:%s(%s)", remoteName, method, SerializeArgs(...)), "REMOTE")
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+    end)
+    if hookOk then
+        Log("📡 [DEVICE DIAG] Перехватчик исходящих ремоутов (__namecall) активирован", "INFO")
+    else
+        Log("⚠️ [DEVICE DIAG] Не удалось установить хук __namecall: " .. tostring(hookErr), "WARN")
+    end
+end
+
+-- Запуск проверки DeviceSelect
+task.spawn(function()
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+    if not playerGui then return end
+
+    local existing = playerGui:FindFirstChild("DeviceSelect")
+    if existing then
+        InspectDeviceSelectGui(existing)
+    end
+
+    local devAddedConn = playerGui.ChildAdded:Connect(function(child)
+        if child.Name == "DeviceSelect" then
+            task.wait(0.2)
+            InspectDeviceSelectGui(child)
+        end
+    end)
+    table.insert(activeConnections, devAddedConn)
+end)
+
+-- =====================================================================
+-- ЗАКРЫТИЕ И ОЧИСТКА
+-- =====================================================================
+local function Terminate()
+    if isTerminated then return end
+    isTerminated = true
+
+    for _, conn in ipairs(activeConnections) do
+        if conn and conn.Connected then pcall(function() conn:Disconnect() end) end
+    end
+    table.clear(activeConnections)
+
+    if ScreenGui and ScreenGui.Parent then ScreenGui:Destroy() end
+    print("[MM2 Round Monitor] Скрипт закрыт, все соединения отключены.")
+end
+
+CloseBtn.MouseButton1Click:Connect(Terminate)
+
+-- Приветственные логи
+Log("🛰 Скрипт мониторинга раундов MM2 запущен!", "INFO")
+Log("Отслеживаются: спавн/очистка карты, спавн монет, фазы голосования, сетевые ремоуты (RoleSelect, RoundStart, RoundEndFade, PlayerDataChanged).", "INFO")
+Log("Нажмите '💾 ЭКСПОРТ ЛОГА' или '📋 СКОПИРОВАТЬ', когда запишется раунд.", "DATA")
