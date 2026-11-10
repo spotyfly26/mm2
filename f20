@@ -308,6 +308,7 @@ end
 local function AutoFarmCleanUp()
     table.clear(rt.touchedCoins)
     table.clear(rt.cachedCoins)
+    table.clear(rt.cachedBodyParts)
     if rt.Added then
         rt.Added:Disconnect()
         rt.Added = nil
@@ -415,7 +416,7 @@ end
 -- =====================================================================
 local CurrentMapInstance: Instance? = nil
 local CurrentMapSpawnPosition: Vector3? = nil
-local candidateConnections: { [Instance]: { RBXScriptConnection } } = {}
+local candidateConnections: { [Instance]: { RBXScriptConnection } } = setmetatable({}, { __mode = "k" }) :: any
 
 local function DisconnectCandidate(child: Instance)
     local conns = candidateConnections[child]
@@ -503,6 +504,7 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
         task.spawn(function()
             local cc = child:WaitForChild("CoinContainer", 15)
             if cc and not rt.coinContainer and CurrentMapInstance == child then
+                if ccConn then ccConn:Disconnect(); ccConn = nil end
                 rt.coinContainer = cc
                 if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
                     PopulateCoins()
@@ -511,12 +513,14 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
         end)
     end
 
-    local remConn = child.AncestryChanged:Connect(function(_, parent)
+    local remConn: RBXScriptConnection? = nil
+    remConn = child.AncestryChanged:Connect(function(_, parent)
         if not parent or parent ~= Workspace then
+            if remConn then remConn:Disconnect(); remConn = nil end
             CleanupMap(child)
         end
     end)
-    RegisterConnection(remConn)
+    if remConn then RegisterConnection(remConn) end
 end
 
 local function InspectMapCandidate(child: Instance)
@@ -562,6 +566,8 @@ local function InspectMapCandidate(child: Instance)
                 if CurrentMapInstance ~= child then
                     RegisterMap(child, foundSpawns, foundContainer)
                 end
+            else
+                DisconnectCandidate(child)
             end
         end)
     end
@@ -1058,12 +1064,25 @@ local function BindClick(guiElement, callback)
 end
 
 -- === УНИВЕРСАЛЬНЫЙ UI-ПАРСЕР СУМКИ (ТЕЛЕФОН / ПЛАНШЕТ / ПК) ===
+local BagConnections: { [Instance]: { RBXScriptConnection } } = setmetatable({}, { __mode = "k" }) :: any
+
+local function DisconnectBag(bagFrame: Instance)
+    local conns = BagConnections[bagFrame]
+    if conns then
+        for _, c in ipairs(conns) do
+            if c and c.Connected then pcall(function() c:Disconnect() end) end
+        end
+        BagConnections[bagFrame] = nil
+    end
+end
+
 local function SetupBagParser()
     task.spawn(function()
         local playerGui = LocalPlayer:WaitForChild("PlayerGui", 15)
         if not playerGui then return end
 
-        local hookedContainers: { [Instance]: boolean } = {}
+        local hookedContainers: { [Instance]: boolean } = setmetatable({}, { __mode = "k" }) :: any
+        local mainGuiDescConn: RBXScriptConnection? = nil
 
         -- Полная проверка реальной видимости на экране (по аналогии с votepads)
         local function isBagActuallyVisible(bagFrame: GuiObject, coinsLabel: TextLabel?): boolean
@@ -1103,6 +1122,11 @@ local function SetupBagParser()
                 -- coinsLabel — единственный строго обязательный элемент для подсчета монет
                 if not coinsLabel or not coinsLabel:IsA("TextLabel") then return end
 
+                -- Очищаем любые старые соединения для этого фрейма перед новой привязкой
+                DisconnectBag(bagFrame)
+                local bagConns: { RBXScriptConnection } = {}
+                BagConnections[bagFrame] = bagConns
+
                 -- Опциональные индикаторы заполненности (не блокируют привязку, если их нет)
                 local fullLabel = bagFrame:FindFirstChild("Full") :: TextLabel?
                 local fullBagIcon = bagFrame:FindFirstChild("FullBagIcon") :: ImageLabel?
@@ -1124,7 +1148,6 @@ local function SetupBagParser()
                         isFull = true
                     end
 
-                    local fullBagIcon = bagFrame:FindFirstChild("FullBagIcon")
                     if fullBagIcon and fullBagIcon:IsA("ImageLabel") and fullBagIcon.Visible and fullBagIcon.ImageTransparency < 1 then
                         isFull = true
                     end
@@ -1140,7 +1163,7 @@ local function SetupBagParser()
                 end
 
                 -- Реактивное обновление при изменении текста количества монет
-                RegisterConnection(coinsLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                table.insert(bagConns, coinsLabel:GetPropertyChangedSignal("Text"):Connect(function()
                     if IsTerminated then return end
                     if not isBagActuallyVisible(bagFrame, coinsLabel) then return end
 
@@ -1161,7 +1184,7 @@ local function SetupBagParser()
                 end))
 
                 -- Проверка при изменении видимости самого фрейма
-                RegisterConnection(bagFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+                table.insert(bagConns, bagFrame:GetPropertyChangedSignal("Visible"):Connect(function()
                     if IsTerminated then return end
                     if RoundInProgress() and isBagActuallyVisible(bagFrame, coinsLabel) then
                         ActiveCurrencyName = bagFrame.Name
@@ -1170,11 +1193,11 @@ local function SetupBagParser()
                     end
                 end))
 
-                -- Проверка при изменении видимости всех предков (Container -> CoinBags -> Game/Dock)
+                -- Проверка при изменении видимости всех предков с изоляцией в bagConns (отключаются вместе с сумкой)
                 local currParent: Instance? = bagFrame.Parent
                 while currParent and currParent:IsA("GuiObject") do
                     local pObj = currParent :: GuiObject
-                    RegisterConnection(pObj:GetPropertyChangedSignal("Visible"):Connect(function()
+                    table.insert(bagConns, pObj:GetPropertyChangedSignal("Visible"):Connect(function()
                         if IsTerminated then return end
                         if RoundInProgress() and isBagActuallyVisible(bagFrame, coinsLabel) then
                             ActiveCurrencyName = bagFrame.Name
@@ -1186,33 +1209,40 @@ local function SetupBagParser()
                 end
 
                 if fullLabel then
-                    RegisterConnection(fullLabel:GetPropertyChangedSignal("Visible"):Connect(function()
+                    table.insert(bagConns, fullLabel:GetPropertyChangedSignal("Visible"):Connect(function()
                         if IsTerminated then return end
                         checkFull()
                     end))
 
-                    RegisterConnection(fullLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                    table.insert(bagConns, fullLabel:GetPropertyChangedSignal("Text"):Connect(function()
                         if IsTerminated then return end
                         checkFull()
                     end))
 
-                    RegisterConnection(fullLabel:GetPropertyChangedSignal("TextTransparency"):Connect(function()
+                    table.insert(bagConns, fullLabel:GetPropertyChangedSignal("TextTransparency"):Connect(function()
                         if IsTerminated then return end
                         checkFull()
                     end))
                 end
 
                 if fullBagIcon then
-                    RegisterConnection(fullBagIcon:GetPropertyChangedSignal("Visible"):Connect(function()
+                    table.insert(bagConns, fullBagIcon:GetPropertyChangedSignal("Visible"):Connect(function()
                         if IsTerminated then return end
                         checkFull()
                     end))
 
-                    RegisterConnection(fullBagIcon:GetPropertyChangedSignal("ImageTransparency"):Connect(function()
+                    table.insert(bagConns, fullBagIcon:GetPropertyChangedSignal("ImageTransparency"):Connect(function()
                         if IsTerminated then return end
                         checkFull()
                     end))
                 end
+
+                -- Автоматическое отключение и очистка при удалении фрейма сумки
+                table.insert(bagConns, bagFrame.AncestryChanged:Connect(function(_, parent)
+                    if not parent or not bagFrame:IsDescendantOf(game) then
+                        DisconnectBag(bagFrame)
+                    end
+                end))
 
                 -- Начальная инициализация при старте
                 if RoundInProgress() and isBagActuallyVisible(bagFrame, coinsLabel) then
@@ -1226,10 +1256,16 @@ local function SetupBagParser()
                 bindToCurrencyBag(bag)
             end
 
-            RegisterConnection(container.ChildAdded:Connect(function(child)
+            local containerAddConn = container.ChildAdded:Connect(function(child)
                 if IsTerminated then return end
                 bindToCurrencyBag(child)
-            end))
+            end)
+            RegisterConnection(containerAddConn)
+
+            local containerRemConn = container.ChildRemoved:Connect(function(child)
+                DisconnectBag(child)
+            end)
+            RegisterConnection(containerRemConn)
         end
 
         local function scanAndHookContainers(mainGui: Instance)
@@ -1261,13 +1297,18 @@ local function SetupBagParser()
                 end
             end
 
-            -- 4. Реактивный перехват динамического появления Container без постоянных циклов
-            RegisterConnection(mainGui.DescendantAdded:Connect(function(desc)
+            -- 4. Реактивный перехват динамического появления Container с защитой от накопления слушателей
+            if mainGuiDescConn then
+                mainGuiDescConn:Disconnect()
+                mainGuiDescConn = nil
+            end
+            mainGuiDescConn = mainGui.DescendantAdded:Connect(function(desc)
                 if IsTerminated then return end
                 if desc.Name == "Container" and desc.Parent and desc.Parent.Name == "CoinBags" then
                     hookContainer(desc)
                 end
-            end))
+            end)
+            if mainGuiDescConn then RegisterConnection(mainGuiDescConn) end
         end
 
         local existingMain = playerGui:FindFirstChild("MainGUI")
@@ -1377,7 +1418,6 @@ local function HookInventoryTokensLabel(lbl: TextLabel)
             updateStatsDisplay()
         end
     end)
-    RegisterConnection(tokensChangedConn)
 
     tokensAncestryConn = lbl.AncestryChanged:Connect(function(_, parent)
         if not parent or not lbl:IsDescendantOf(game) then
@@ -1392,7 +1432,6 @@ local function HookInventoryTokensLabel(lbl: TextLabel)
             cachedTokensLabel = nil
         end
     end)
-    if tokensAncestryConn then RegisterConnection(tokensAncestryConn) end
 end
 
 local function SetupInventoryTokensWatcher()
@@ -1708,6 +1747,23 @@ local function PreRoundKillChain()
     local netEndConn: RBXScriptConnection? = nil
     local uiTextConn: RBXScriptConnection? = nil
 
+    local function cleanupChain()
+        isChainRunning = false
+        if netTargetConn then
+            pcall(function() netTargetConn:Disconnect() end)
+            netTargetConn = nil
+        end
+        if netEndConn then
+            pcall(function() netEndConn:Disconnect() end)
+            netEndConn = nil
+        end
+        if uiTextConn then
+            pcall(function() uiTextConn:Disconnect() end)
+            uiTextConn = nil
+        end
+        UnequipKnife()
+    end
+
     local function TryEliminateTarget(plr: Player, rawName: string?)
         if not isChainRunning or IsTerminated or (SETTINGS.RoundMode ~= "Assassin" and SETTINGS.RoundMode ~= "Clear") then
             isChainRunning = false
@@ -1757,146 +1813,151 @@ local function PreRoundKillChain()
         UpdateStatus("Удар: " .. plr.DisplayName .. " (Живых: " .. aliveCount .. ")", Color3.fromRGB(255, 80, 80))
     end
 
-    -- Сетевой перехват ChangeTarget (0 мс задержки)
-    if changeTargetEvent then
-        netTargetConn = changeTargetEvent.OnClientEvent:Connect(function(targetName: any, _, _, targetUserId: any)
+    local chainOk, chainErr = pcall(function()
+        -- Сетевой перехват ChangeTarget (0 мс задержки)
+        if changeTargetEvent then
+            netTargetConn = changeTargetEvent.OnClientEvent:Connect(function(targetName: any, _, _, targetUserId: any)
+                if not isChainRunning or IsTerminated then return end
+
+                local targetPlr: Player? = nil
+                if typeof(targetUserId) == "number" and targetUserId > 0 then
+                    targetPlr = Players:GetPlayerByUserId(targetUserId)
+                end
+                if not targetPlr and typeof(targetName) == "string" and targetName ~= "" then
+                    targetPlr = Players:FindFirstChild(targetName) or FindPlayerByName(targetName)
+                end
+
+                if targetPlr then
+                    activeTargetPlayer = targetPlr
+                    activeTargetName = targetPlr.Name
+                    TryEliminateTarget(targetPlr, tostring(targetName or ""))
+                end
+            end)
+        end
+
+        -- Сетевой перехват окончания раунда
+        if roundEndEvent then
+            netEndConn = roundEndEvent.OnClientEvent:Connect(function()
+                UpdateStatus("Зачистка: Раунд завершён (RoundEndFade)", Color3.fromRGB(100, 255, 120))
+                isChainRunning = false
+            end)
+        end
+
+        -- UI-проверка текущей цели (на случай, если раунд уже начался до этого момента)
+        local targetLabel = FindTargetLabel()
+        local function CheckFromUi()
             if not isChainRunning or IsTerminated then return end
+            if not targetLabel or not IsTargetVisible(targetLabel) then return end
 
-            local targetPlr: Player? = nil
-            if typeof(targetUserId) == "number" and targetUserId > 0 then
-                targetPlr = Players:GetPlayerByUserId(targetUserId)
+            local raw = targetLabel.Text
+            local clean = CleanNickname(raw)
+            if clean == "" or clean == "Label" or clean == "None" then return end
+
+            local plr = FindPlayerByName(clean)
+            if plr then
+                activeTargetPlayer = plr
+                activeTargetName = plr.Name
+                TryEliminateTarget(plr, raw)
             end
-            if not targetPlr and typeof(targetName) == "string" and targetName ~= "" then
-                targetPlr = Players:FindFirstChild(targetName) or FindPlayerByName(targetName)
-            end
-
-            if targetPlr then
-                activeTargetPlayer = targetPlr
-                activeTargetName = targetPlr.Name
-                TryEliminateTarget(targetPlr, tostring(targetName or ""))
-            end
-        end)
-    end
-
-    -- Сетевой перехват окончания раунда
-    if roundEndEvent then
-        netEndConn = roundEndEvent.OnClientEvent:Connect(function()
-            UpdateStatus("Зачистка: Раунд завершён (RoundEndFade)", Color3.fromRGB(100, 255, 120))
-            isChainRunning = false
-        end)
-    end
-
-    -- UI-проверка текущей цели (на случай, если раунд уже начался до этого момента)
-    local targetLabel = FindTargetLabel()
-    local function CheckFromUi()
-        if not isChainRunning or IsTerminated then return end
-        if not targetLabel or not IsTargetVisible(targetLabel) then return end
-
-        local raw = targetLabel.Text
-        local clean = CleanNickname(raw)
-        if clean == "" or clean == "Label" or clean == "None" then return end
-
-        local plr = FindPlayerByName(clean)
-        if plr then
-            activeTargetPlayer = plr
-            activeTargetName = plr.Name
-            TryEliminateTarget(plr, raw)
-        end
-    end
-
-    if targetLabel then
-        uiTextConn = targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
-            CheckFromUi()
-        end)
-    end
-
-    CheckFromUi()
-
-    -- Watchdog-цикл добивания и контроля живых участников
-    local noTargetStreak = 0
-    local startTime = tick()
-
-    while isChainRunning and not IsTerminated and SETTINGS.AutoFarmEnabled and CurrentState == State.Action and not BagIsFull and (SETTINGS.RoundMode == "Assassin" or SETTINGS.RoundMode == "Clear") do
-        task.wait(0.05)
-
-        -- Проверка нашего персонажа и раунда
-        local myChar = LocalPlayer.Character
-        local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
-        if not myChar or not myHum or myHum.Health <= 0 then break end
-        if not RoundInProgress() or not rt:CheckIfPlayerWasInARound() then break end
-
-        -- Проверка количества живых игроков
-        local aliveCount = CountAliveRoundPlayers()
-        local stopLimit = (SETTINGS.RoundMode == "Clear") and 1 or 2
-        if aliveCount <= stopLimit then
-            UpdateStatus("Зачистка: " .. (aliveCount <= 1 and "Остался 1 участник (только вы)" or ("Осталось " .. aliveCount .. " участников")) .. ". Завершено.", Color3.fromRGB(100, 255, 120))
-            break
         end
 
-        -- Авто-добивание цели, если она ещё не погибла
-        if activeTargetPlayer and activeTargetPlayer.Character then
-            local tHum = activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid")
-            if tHum and tHum.Health > 0 then
-                if SETTINGS.RoundMode ~= "Clear" and SETTINGS.GameMode == "Twin" and IsTwinPlayer(activeTargetPlayer, activeTargetName) then
-                    UpdateStatus("Зачистка: Цель — Твинк. Стоп.", Color3.fromRGB(100, 255, 120))
+        if targetLabel then
+            uiTextConn = targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                CheckFromUi()
+            end)
+        end
+
+        CheckFromUi()
+
+        -- Watchdog-цикл добивания и контроля живых участников
+        local noTargetStreak = 0
+        local startTime = tick()
+
+        while isChainRunning and not IsTerminated and SETTINGS.AutoFarmEnabled and CurrentState == State.Action and not BagIsFull and (SETTINGS.RoundMode == "Assassin" or SETTINGS.RoundMode == "Clear") do
+            task.wait(0.05)
+
+            -- Проверка нашего персонажа и раунда
+            local myChar = LocalPlayer.Character
+            local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+            if not myChar or not myHum or myHum.Health <= 0 then break end
+            if not RoundInProgress() or not rt:CheckIfPlayerWasInARound() then break end
+
+            -- Проверка количества живых игроков
+            local aliveCount = CountAliveRoundPlayers()
+            local stopLimit = (SETTINGS.RoundMode == "Clear") and 1 or 2
+            if aliveCount <= stopLimit then
+                UpdateStatus("Зачистка: " .. (aliveCount <= 1 and "Остался 1 участник (только вы)" or ("Осталось " .. aliveCount .. " участников")) .. ". Завершено.", Color3.fromRGB(100, 255, 120))
+                break
+            end
+
+            -- Авто-добивание цели, если она ещё не погибла
+            if activeTargetPlayer and activeTargetPlayer.Character then
+                local tHum = activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if tHum and tHum.Health > 0 then
+                    if SETTINGS.RoundMode ~= "Clear" and SETTINGS.GameMode == "Twin" and IsTwinPlayer(activeTargetPlayer, activeTargetName) then
+                        UpdateStatus("Зачистка: Цель — Твинк. Стоп.", Color3.fromRGB(100, 255, 120))
+                        break
+                    end
+
+                    if aliveCount <= stopLimit then break end
+
+                    knife = InspectAndEquipKnife() or knife
+                    TurboKill(activeTargetPlayer, knife)
+                end
+            end
+
+            -- Проверка UI если сетевой цели нет (с ленивым кэшированием и отпиской старых соединений)
+            if not targetLabel or not targetLabel.Parent then
+                if uiTextConn then
+                    pcall(function() uiTextConn:Disconnect() end)
+                    uiTextConn = nil
+                end
+                targetLabel = FindTargetLabel()
+                if targetLabel then
+                    uiTextConn = targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                        CheckFromUi()
+                    end)
+                end
+            end
+            local currentLbl = targetLabel
+            local isVis = IsTargetVisible(currentLbl)
+            local raw = currentLbl and currentLbl.Text or ""
+            local clean = CleanNickname(raw)
+            local hasTarget = isVis and clean ~= "" and clean ~= "Label" and clean ~= "None"
+
+            if hasTarget then
+                noTargetStreak = 0
+                if not activeTargetPlayer or not activeTargetPlayer.Character or (activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid") and activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid").Health <= 0) then
+                    local plr = FindPlayerByName(clean)
+                    if plr and plr ~= activeTargetPlayer then
+                        activeTargetPlayer = plr
+                        activeTargetName = plr.Name
+                        TryEliminateTarget(plr, raw)
+                    end
+                end
+            else
+                noTargetStreak = noTargetStreak + 1
+                if noTargetStreak >= 20 then
+                    -- Окно таргетов скрыто более 1 секунды
+                    UpdateStatus("Зачистка: Таргеты отсутствуют", Color3.fromRGB(150, 200, 255))
                     break
                 end
-
-                if aliveCount <= stopLimit then break end
-
-                knife = InspectAndEquipKnife() or knife
-                TurboKill(activeTargetPlayer, knife)
             end
-        end
 
-        -- Проверка UI если сетевой цели нет (с ленивым кэшированием)
-        if not targetLabel or not targetLabel.Parent then
-            targetLabel = FindTargetLabel()
-            if targetLabel and not uiTextConn then
-                uiTextConn = targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
-                    CheckFromUi()
-                end)
-            end
-        end
-        local currentLbl = targetLabel
-        local isVis = IsTargetVisible(currentLbl)
-        local raw = currentLbl and currentLbl.Text or ""
-        local clean = CleanNickname(raw)
-        local hasTarget = isVis and clean ~= "" and clean ~= "Label" and clean ~= "None"
-
-        if hasTarget then
-            noTargetStreak = 0
-            if not activeTargetPlayer or not activeTargetPlayer.Character or (activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid") and activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid").Health <= 0) then
-                local plr = FindPlayerByName(clean)
-                if plr and plr ~= activeTargetPlayer then
-                    activeTargetPlayer = plr
-                    activeTargetName = plr.Name
-                    TryEliminateTarget(plr, raw)
-                end
-            end
-        else
-            noTargetStreak = noTargetStreak + 1
-            if noTargetStreak >= 20 then
-                -- Окно таргетов скрыто более 1 секунды
-                UpdateStatus("Зачистка: Таргеты отсутствуют", Color3.fromRGB(150, 200, 255))
+            -- Защитный тайм-аут зачистки (не более 12 секунд)
+            if tick() - startTime > 12 then
+                UpdateStatus("Зачистка: Тайм-аут. Переход к фарму.", Color3.fromRGB(200, 200, 100))
                 break
             end
         end
+    end)
 
-        -- Защитный тайм-аут зачистки (не более 12 секунд)
-        if tick() - startTime > 12 then
-            UpdateStatus("Зачистка: Тайм-аут. Переход к фарму.", Color3.fromRGB(200, 200, 100))
-            break
-        end
+    if not chainOk then
+        warn("[MM2 AIO] Ошибка в PreRoundKillChain: " .. tostring(chainErr))
     end
 
-    -- Отключение слушателей зачистки
-    if netTargetConn then netTargetConn:Disconnect() end
-    if netEndConn then netEndConn:Disconnect() end
-    if uiTextConn then uiTextConn:Disconnect() end
-
-    -- Прячем нож в инвентарь перед началом сбора монет
-    UnequipKnife()
+    -- Гарантированное отключение всех слушателей зачистки и возврат ножа в рюкзак
+    cleanupChain()
     task.wait(0.15)
 end
 
@@ -2109,16 +2170,24 @@ end)
 
 -- Перетаскивание окна
 local dragging, dragInput, dragStart, startPos
+local dragEndConn: RBXScriptConnection? = nil
+
 RegisterConnection(TitleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
         dragging = true
         dragStart = input.Position
         startPos = MainFrame.Position
-        local endConn
-        endConn = input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
+        if dragEndConn then
+            dragEndConn:Disconnect()
+            dragEndConn = nil
+        end
+        dragEndConn = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
                 dragging = false
-                if endConn then endConn:Disconnect() end
+                if dragEndConn then
+                    dragEndConn:Disconnect()
+                    dragEndConn = nil
+                end
             end
         end)
     end
@@ -3507,6 +3576,7 @@ end
 
 rt.UserDied = RegisterConnection(rt.player.CharacterRemoving:Connect(function(character)
     if IsTerminated then return end
+    table.clear(rt.cachedBodyParts)
     AutoFarmCleanUp()
     BagIsFull = false
     if RoundInProgress() then
@@ -3837,6 +3907,19 @@ local function TerminateScript()
     end
     table.clear(rt.potatoConnections)
     
+    if dragEndConn then
+        pcall(function() dragEndConn:Disconnect() end)
+        dragEndConn = nil
+    end
+
+    for bag, conns in pairs(BagConnections) do
+        for _, c in ipairs(conns) do
+            if c and c.Connected then pcall(function() c:Disconnect() end) end
+        end
+    end
+    table.clear(BagConnections)
+
+    table.clear(rt.cachedBodyParts)
     AutoFarmCleanUp()
 
     if tokensChangedConn then
