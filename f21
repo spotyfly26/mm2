@@ -53,6 +53,116 @@ end)
 
 local HttpService = game:GetService("HttpService")
 
+-- === БАЗА ДАННЫХ РАЗМЕРОВ КАРТ (АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ) ===
+local MAP_SIZES_FILE = "mm2_map_sizes.json"
+local MapSizesCache: { [string]: number } = {}
+
+local function LoadMapSizes(): { [string]: number }
+    local rf = readfile or (syn and syn.readfile)
+    local isf = isfile or (syn and syn.isfile)
+    if typeof(isf) == "function" and typeof(rf) == "function" then
+        local ok, exists = pcall(isf, MAP_SIZES_FILE)
+        if ok and exists then
+            local readOk, content = pcall(rf, MAP_SIZES_FILE)
+            if readOk and typeof(content) == "string" and content ~= "" then
+                local decodeOk, data = pcall(function()
+                    return HttpService:JSONDecode(content)
+                end)
+                if decodeOk and typeof(data) == "table" then
+                    local cleanData: { [string]: number } = {}
+                    for k, v in pairs(data) do
+                        if typeof(k) == "string" and typeof(v) == "number" then
+                            cleanData[string.lower(k)] = v
+                        end
+                    end
+                    return cleanData
+                end
+            end
+        end
+    end
+    return {}
+end
+
+MapSizesCache = LoadMapSizes()
+
+local function SaveMapSize(mapName: string, area: number)
+    if not mapName or mapName == "" or not area or area <= 0 then return end
+    local lowerName = string.lower(mapName)
+    if MapSizesCache[lowerName] == area then return end
+
+    MapSizesCache[lowerName] = area
+
+    local wf = writefile or (syn and syn.writefile)
+    if typeof(wf) == "function" then
+        pcall(function()
+            local jsonStr = HttpService:JSONEncode(MapSizesCache)
+            wf(MAP_SIZES_FILE, jsonStr)
+        end)
+    end
+end
+
+local function CalculateMapArea(mapModel: Instance): number?
+    local minX, maxX = math.huge, -math.huge
+    local minZ, maxZ = math.huge, -math.huge
+    local pointsCount = 0
+
+    local container = mapModel:FindFirstChild("CoinContainer")
+    if container then
+        for _, child in ipairs(container:GetChildren()) do
+            local p: Vector3? = nil
+            if child:IsA("BasePart") then
+                p = child.Position
+            elseif child:IsA("Model") then
+                local prim = child.PrimaryPart or child:FindFirstChildWhichIsA("BasePart")
+                if prim then p = prim.Position end
+            end
+            if p then
+                pointsCount = pointsCount + 1
+                if p.X < minX then minX = p.X end
+                if p.X > maxX then maxX = p.X end
+                if p.Z < minZ then minZ = p.Z end
+                if p.Z > maxZ then maxZ = p.Z end
+            end
+        end
+    end
+
+    if pointsCount >= 4 and minX < maxX and minZ < maxZ then
+        local w = maxX - minX
+        local d = maxZ - minZ
+        return math.floor(w * d)
+    end
+
+    if mapModel:IsA("Model") then
+        local ok, cf, size = pcall(function() return (mapModel :: Model):GetBoundingBox() end)
+        if ok and size and size.X > 0 and size.Z > 0 then
+            return math.floor(size.X * size.Z)
+        end
+    end
+
+    return nil
+end
+
+local function RecordMapSizeIfNew(mapInstance: Instance)
+    task.spawn(function()
+        task.wait(2)
+        if IsTerminated or not mapInstance or not mapInstance.Parent then return end
+        local rawName = mapInstance.Name
+        if rawName == "" or rawName == "Workspace" or rawName == "Lobby" then return end
+
+        local lowerName = string.lower(rawName)
+        if MapSizesCache[lowerName] and MapSizesCache[lowerName] > 0 then
+            return
+        end
+
+        local area = CalculateMapArea(mapInstance)
+        if area and area > 0 then
+            SaveMapSize(rawName, area)
+            print(string.format("[MM2 AIO] Новая карта '%s' замерена! Площадь XZ: %d кв. студов. Сохранено в %s", rawName, area, MAP_SIZES_FILE))
+            UpdateStatus(string.format("База карт: '%s' = %d студов", rawName, area), Color3.fromRGB(100, 255, 150))
+        end
+    end)
+end
+
 -- === СОХРАНЕНИЕ / ЗАГРУЗКА ПРОФИЛЯ ===
 local PROFILE_FILE = "profile"
 
@@ -144,6 +254,7 @@ local function SaveProfile(statsVisible: boolean?, rejoinVisible: boolean?): boo
     return false
 end
 
+-- Базовый fallback-список на случай отсутствия файловой системы у инжектора
 local MAP_PRIORITIES = {
     "Hospital 3", "House 2", "Office 3", "Bank 2", "Workplace",
     "Factory", "Mansion 2", "Police Station", "Research Facility",
@@ -521,6 +632,9 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
         end
     end)
     if remConn then RegisterConnection(remConn) end
+
+    -- Автоматическое измерение и сохранение размера новой карты
+    RecordMapSizeIfNew(child)
 end
 
 local function InspectMapCandidate(child: Instance)
@@ -3598,12 +3712,18 @@ end))
 -- === АВТО-ГОЛОСОВАНИЕ ===
 local LastVoteSession = ""
 
-local function GetMapPriority(mapName)
+local function GetMapPriority(mapName: string): (number, boolean)
     local lowerMap = string.lower(mapName)
-    for i, name in ipairs(MAP_PRIORITIES) do
-        if string.lower(name) == lowerMap then return i end
+    local cachedArea = MapSizesCache[lowerMap]
+
+    -- 1. Если карта ещё не исследована и отсутствует в базе:
+    -- Назначаем наивысший приоритет (меньше 0), чтобы скрипт голосовал за неё
+    if not cachedArea or cachedArea <= 0 then
+        return -1, false
     end
-    return 999
+
+    -- 2. Если карта известна: приоритет равен её площади (чем меньше площадь XZ, тем выше приоритет)
+    return cachedArea, true
 end
 
 local function ScanVotePads()
@@ -3741,19 +3861,43 @@ task.spawn(function()
         for name, _ in pairs(availableMaps) do table.insert(mapNames, name) end
         if #mapNames < 2 then continue end
 
-        local bestMap, bestPriority, bestCFrame = nil, 999, nil
+        -- Разделение доступных стендов на новые (неисследованные) и уже известные
+        local unknownMaps: { { name: string, cframe: CFrame } } = {}
+        local knownMaps: { { name: string, area: number, cframe: CFrame } } = {}
+
         for name, tpCFrame in pairs(availableMaps) do
-            local priority = GetMapPriority(name)
-            if priority < bestPriority then
-                bestPriority = priority
-                bestMap = name
-                bestCFrame = tpCFrame
+            local priority, isKnown = GetMapPriority(name)
+            if not isKnown then
+                table.insert(unknownMaps, { name = name, cframe = tpCFrame })
+            else
+                table.insert(knownMaps, { name = name, area = priority, cframe = tpCFrame })
             end
         end
 
-        if bestMap and bestPriority < 999 and bestCFrame then
+        local bestMap: string? = nil
+        local bestCFrame: CFrame? = nil
+        local voteReason = ""
+
+        -- 1. Если есть неизвестные карты, отдаём приоритет им (если их несколько — выбираем случайную)
+        if #unknownMaps > 0 then
+            local chosen = unknownMaps[math.random(1, #unknownMaps)]
+            bestMap = chosen.name
+            bestCFrame = chosen.cframe
+            voteReason = string.format("новая карта, исследование [%d в пуле]", #unknownMaps)
+        elseif #knownMaps > 0 then
+            -- 2. Если все карты известны — выбираем самую компактную (с наименьшей площадью)
+            table.sort(knownMaps, function(a, b)
+                return a.area < b.area
+            end)
+            local chosen = knownMaps[1]
+            bestMap = chosen.name
+            bestCFrame = chosen.cframe
+            voteReason = string.format("компактная: %d студов", chosen.area)
+        end
+
+        if bestMap and bestCFrame then
             local maxVotes = SETTINGS.VoteSpamEnabled and 11 or 1
-            UpdateStatus(string.format("Голос: Старт (%s, %s)", bestMap, SETTINGS.VoteSpamEnabled and "спам до 11" or "1 голос"), Color3.fromRGB(50, 255, 255))
+            UpdateStatus(string.format("Голос: [%s] (%s | %s)", bestMap, voteReason, SETTINGS.VoteSpamEnabled and "спам до 11" or "1 голос"), Color3.fromRGB(50, 255, 255))
 
             local voteCount = 0
             isVotingNoclip = true
