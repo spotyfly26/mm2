@@ -251,7 +251,8 @@ end
 
 RegisterConnection(RunService.Stepped:Connect(function()
     if IsTerminated then return end
-    if isVotingNoclip or (SETTINGS.AutoFarmEnabled and CurrentState == State.Action and rt:CheckIfPlayerWasInARound()) then
+    if isVotingNoclip or (SETTINGS.AutoFarmEnabled and CurrentState == State.Action) then
+        if #rt.cachedBodyParts == 0 then updateBodyPartsCache() end
         for _, part in ipairs(rt.cachedBodyParts) do
             if part and part.Parent and part.CanCollide then
                 part.CanCollide = false
@@ -662,12 +663,29 @@ function rt:CheckIfPlayerWasInARound(): boolean
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return false end
 
+    -- Если игрок мёртв по серверным данным — он точно не в раунде
+    if PlayerAliveCache[LocalPlayer.Name] == true then
+        return false
+    end
+
+    -- Если мы УЖЕ находимся в активной фазе раунда (State.Action) — раунд идёт,
+    -- персонаж жив и карта существует: исключаем любые ложные сбросы ноклипа/фарма при полётах
+    if CurrentState == State.Action then
+        return true
+    end
+
     -- Строгая серверная проверка (если уже получены сетевые пакеты):
     -- true  -> Мёртв (Dead = true)
     -- false -> В раунде и жив (Dead = false)
     local cachedStatus = PlayerAliveCache[LocalPlayer.Name]
     if cachedStatus ~= nil then
         return cachedStatus == false
+    end
+
+    -- Проверка наличия роли (Infection: Survivor/Infected, Classic: Innocent/Sheriff/Murderer и др.)
+    if HasAssignedRole() then
+        PlayerAliveCache[LocalPlayer.Name] = false
+        return true
     end
 
     -- Проверка физического переноса персонажа на карту (к Spawns карты, а не в лобби)
