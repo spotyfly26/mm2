@@ -59,7 +59,7 @@ ScreenGui.Parent = safeParent
 
 local WINDOW_WIDTH = 420
 local EXPANDED_HEIGHT = 440
-local COLLAPSED_HEIGHT = 160
+local COLLAPSED_HEIGHT = 190
 local isLogsCollapsed = false
 
 local MainFrame = Instance.new("Frame")
@@ -250,9 +250,9 @@ LblLocalPlayerStatus.TextSize = 10
 LblLocalPlayerStatus.TextXAlignment = Enum.TextXAlignment.Left
 LblLocalPlayerStatus.Parent = StateInfoFrame
 
--- Контейнер кнопок управления
+-- Контейнер кнопок управления (2 ряда)
 local ControlsFrame = Instance.new("Frame")
-ControlsFrame.Size = UDim2.new(1, -16, 0, 28)
+ControlsFrame.Size = UDim2.new(1, -16, 0, 58)
 ControlsFrame.Position = UDim2.new(0, 8, 0, 98)
 ControlsFrame.BackgroundTransparency = 1
 ControlsFrame.Parent = MainFrame
@@ -271,15 +271,18 @@ local function CreateButton(text: string, color: Color3, pos: UDim2, size: UDim2
     return btn
 end
 
-local BtnExport = CreateButton("💾 ЭКСПОРТ", Color3.fromRGB(40, 130, 200), UDim2.new(0, 0, 0, 0), UDim2.new(0.26, -2, 1, 0))
-local BtnCopy = CreateButton("📋 БУФЕР", Color3.fromRGB(90, 60, 160), UDim2.new(0.26, 2, 0, 0), UDim2.new(0.24, -2, 1, 0))
-local BtnCheckAttrs = CreateButton("🔍 АТРИБУТЫ", Color3.fromRGB(35, 125, 115), UDim2.new(0.50, 2, 0, 0), UDim2.new(0.28, -2, 1, 0))
-local BtnClear = CreateButton("🗑 ОЧИСТИТЬ", Color3.fromRGB(70, 70, 80), UDim2.new(0.78, 2, 0, 0), UDim2.new(0.22, -2, 1, 0))
+local BtnExport = CreateButton("💾 ЭКСПОРТ", Color3.fromRGB(40, 130, 200), UDim2.new(0, 0, 0, 0), UDim2.new(0.26, -2, 0, 26))
+local BtnCopy = CreateButton("📋 БУФЕР", Color3.fromRGB(90, 60, 160), UDim2.new(0.26, 2, 0, 0), UDim2.new(0.24, -2, 0, 26))
+local BtnCheckAttrs = CreateButton("🔍 АТРИБУТЫ", Color3.fromRGB(35, 125, 115), UDim2.new(0.50, 2, 0, 0), UDim2.new(0.28, -2, 0, 26))
+local BtnClear = CreateButton("🗑 ОЧИСТИТЬ", Color3.fromRGB(70, 70, 80), UDim2.new(0.78, 2, 0, 0), UDim2.new(0.22, -2, 0, 26))
+local BtnMeasureSpawns = CreateButton("📐 ПЛОЩАДЬ ПО SPAWNS", Color3.fromRGB(165, 105, 30), UDim2.new(0, 0, 0, 30), UDim2.new(1, 0, 0, 26))
+
+local MeasureSpawnsArea: () -> () = function() end
 
 -- Консоль вывода событий
 local ConsoleFrame = Instance.new("Frame")
-ConsoleFrame.Size = UDim2.new(1, -16, 1, -136)
-ConsoleFrame.Position = UDim2.new(0, 8, 0, 130)
+ConsoleFrame.Size = UDim2.new(1, -16, 1, -166)
+ConsoleFrame.Position = UDim2.new(0, 8, 0, 160)
 ConsoleFrame.BackgroundColor3 = Color3.fromRGB(12, 13, 18)
 ConsoleFrame.BorderSizePixel = 0
 ConsoleFrame.Parent = MainFrame
@@ -636,6 +639,9 @@ BindButton(CopyTitleBtn, function()
     CopyLogsToClipboard(CopyTitleBtn)
 end)
 BindButton(BtnCheckAttrs, CheckAttributesDiagnostic)
+BindButton(BtnMeasureSpawns, function()
+    MeasureSpawnsArea()
+end)
 
 -- =====================================================================
 -- СЕРИАЛИЗАТОР АРГУМЕНТОВ РЕМОУТОВ
@@ -1106,6 +1112,176 @@ local function GetWorkspaceMap(): Instance?
         return CurrentMapInstance
     end
     return nil
+end
+
+type XZAreaStats = {
+    count: number,
+    hullCount: number,
+    hullArea: number,
+    width: number,
+    depth: number,
+    aabbArea: number,
+}
+
+local function Cross2D(o: Vector2, a: Vector2, b: Vector2): number
+    return (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X)
+end
+
+-- Проекция точек на плоскость XZ -> выпуклая оболочка (без самопересечений) + площадь по формуле шнуровки
+local function ComputeXZStats(points: { Vector2 }): XZAreaStats
+    local minX, maxX = math.huge, -math.huge
+    local minZ, maxZ = math.huge, -math.huge
+    local sorted: { Vector2 } = {}
+
+    for _, p in ipairs(points) do
+        if p.X == p.X and p.Y == p.Y then
+            table.insert(sorted, p)
+            if p.X < minX then minX = p.X end
+            if p.X > maxX then maxX = p.X end
+            if p.Y < minZ then minZ = p.Y end
+            if p.Y > maxZ then maxZ = p.Y end
+        end
+    end
+
+    local count = #sorted
+    if count == 0 then
+        return { count = 0, hullCount = 0, hullArea = 0, width = 0, depth = 0, aabbArea = 0 }
+    end
+
+    local width = maxX - minX
+    local depth = maxZ - minZ
+    local aabbArea = math.floor(width * depth + 0.5)
+
+    table.sort(sorted, function(a: Vector2, b: Vector2): boolean
+        if a.X ~= b.X then return a.X < b.X end
+        return a.Y < b.Y
+    end)
+
+    local unique: { Vector2 } = {}
+    for _, p in ipairs(sorted) do
+        local prev = unique[#unique]
+        if not prev or math.abs(p.X - prev.X) > 1e-3 or math.abs(p.Y - prev.Y) > 1e-3 then
+            table.insert(unique, p)
+        end
+    end
+
+    if #unique < 3 then
+        return { count = count, hullCount = #unique, hullArea = 0, width = width, depth = depth, aabbArea = aabbArea }
+    end
+
+    local lower: { Vector2 } = {}
+    for _, p in ipairs(unique) do
+        while #lower >= 2 and Cross2D(lower[#lower - 1], lower[#lower], p) <= 0 do
+            table.remove(lower)
+        end
+        table.insert(lower, p)
+    end
+
+    local upper: { Vector2 } = {}
+    for i = #unique, 1, -1 do
+        local p = unique[i]
+        while #upper >= 2 and Cross2D(upper[#upper - 1], upper[#upper], p) <= 0 do
+            table.remove(upper)
+        end
+        table.insert(upper, p)
+    end
+
+    table.remove(lower)
+    table.remove(upper)
+    for _, p in ipairs(upper) do
+        table.insert(lower, p)
+    end
+
+    local hullCount = #lower
+    local sum = 0
+    if hullCount >= 3 then
+        for i = 1, hullCount do
+            local a = lower[i]
+            local b = lower[(i % hullCount) + 1]
+            sum = sum + (a.X * b.Y - b.X * a.Y)
+        end
+    end
+
+    return {
+        count = count,
+        hullCount = hullCount,
+        hullArea = math.floor(math.abs(sum) * 0.5 + 0.5),
+        width = width,
+        depth = depth,
+        aabbArea = aabbArea,
+    }
+end
+
+MeasureSpawnsArea = function()
+    local map = GetWorkspaceMap()
+    if not map then
+        DoForceCheckMap()
+        map = GetWorkspaceMap()
+    end
+
+    if not map then
+        Log("⚠️ [SPAWNS] Активная карта в Workspace не найдена (раунд не идёт / вы в лобби)", "WARN")
+        return
+    end
+
+    local spawns = map:FindFirstChild("Spawns")
+    if not spawns then
+        Log(string.format("⚠️ [SPAWNS] На карте '%s' папка Spawns не найдена", map.Name), "WARN")
+        return
+    end
+
+    local spawnPoints: { Vector2 } = {}
+    if spawns:IsA("BasePart") then
+        table.insert(spawnPoints, Vector2.new(spawns.Position.X, spawns.Position.Z))
+    end
+    for _, desc in ipairs(spawns:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            table.insert(spawnPoints, Vector2.new(desc.Position.X, desc.Position.Z))
+        end
+    end
+
+    if #spawnPoints == 0 then
+        Log(string.format("⚠️ [SPAWNS] На карте '%s' внутри Spawns нет BasePart", map.Name), "WARN")
+        return
+    end
+
+    local stats = ComputeXZStats(spawnPoints)
+    local msg = string.format(
+        "📐 [SPAWNS] Карта: '%s' | Площадь XZ: %d кв. студов | Точек: %d (вершин: %d) | AABB: %dx%d = %d",
+        map.Name,
+        stats.hullArea,
+        stats.count,
+        stats.hullCount,
+        math.floor(stats.width + 0.5),
+        math.floor(stats.depth + 0.5),
+        stats.aabbArea
+    )
+    Log(msg, "MAP")
+    print(msg)
+
+    -- Бонус для сравнения на месте: если в CoinContainer уже есть монеты, показываем их площадь XZ
+    local cc = map:FindFirstChild("CoinContainer")
+    if cc then
+        local coinPoints: { Vector2 } = {}
+        for _, desc in ipairs(cc:GetDescendants()) do
+            if desc:IsA("TouchTransmitter") and desc.Parent and desc.Parent:IsA("BasePart") then
+                local pos = desc.Parent.Position
+                table.insert(coinPoints, Vector2.new(pos.X, pos.Z))
+            end
+        end
+        if #coinPoints >= 3 then
+            local cStats = ComputeXZStats(coinPoints)
+            local cMsg = string.format(
+                "🟡 [COINS] Сравнение '%s': %d монет -> Площадь XZ: %d кв. студов (AABB: %d)",
+                map.Name,
+                cStats.count,
+                cStats.hullArea,
+                cStats.aabbArea
+            )
+            Log(cMsg, "COIN")
+            print(cMsg)
+        end
+    end
 end
 
 -- =====================================================================
