@@ -58,9 +58,19 @@ local HttpService = game:GetService("HttpService")
 local IsTerminated = false -- Флаг полного завершения скрипта
 local UpdateStatus: (text: string, color: Color3?) -> () = function() end
 
--- === БАЗА ДАННЫХ РАЗМЕРОВ КАРТ (АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ) ===
+-- === БАЗА ДАННЫХ РАЗМЕРОВ КАРТ (АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ ПО SPAWNS XZ) ===
 local MAP_SIZES_FILE = "mm2_map_sizes.json"
+local SPAWNS_SCHEMA_KEY = "_spawns"
 local MapSizesCache: { [string]: number } = {}
+
+local function NormalizeMapKey(name: string): string
+    local lower = string.lower(name)
+    lower = string.gsub(lower, "'s(%A)", "%1")
+    lower = string.gsub(lower, "'s$", "")
+    lower = string.gsub(lower, "’s(%A)", "%1")
+    lower = string.gsub(lower, "’s$", "")
+    return (string.gsub(lower, "[^%w]", ""))
+end
 
 local function LoadMapSizes(): { [string]: number }
     local rf = readfile or (syn and syn.readfile)
@@ -73,11 +83,15 @@ local function LoadMapSizes(): { [string]: number }
                 local decodeOk, data = pcall(function()
                     return HttpService:JSONDecode(content)
                 end)
-                if decodeOk and typeof(data) == "table" then
+                -- Загружаем только базу, посчитанную по Spawns XZ (игнорируя старый кэш с GetBoundingBox)
+                if decodeOk and typeof(data) == "table" and data[SPAWNS_SCHEMA_KEY] == 1 then
                     local cleanData: { [string]: number } = {}
                     for k, v in pairs(data) do
-                        if typeof(k) == "string" and typeof(v) == "number" then
-                            cleanData[string.lower(k)] = v
+                        if typeof(k) == "string" and k ~= SPAWNS_SCHEMA_KEY and typeof(v) == "number" and v > 0 then
+                            local normKey = NormalizeMapKey(k)
+                            if normKey ~= "" then
+                                cleanData[normKey] = math.floor(v + 0.5)
+                            end
                         end
                     end
                     return cleanData
@@ -92,77 +106,127 @@ MapSizesCache = LoadMapSizes()
 
 local function SaveMapSize(mapName: string, area: number)
     if not mapName or mapName == "" or not area or area <= 0 then return end
-    local lowerName = string.lower(mapName)
-    if MapSizesCache[lowerName] == area then return end
+    local key = NormalizeMapKey(mapName)
+    if key == "" or MapSizesCache[key] == area then return end
 
-    MapSizesCache[lowerName] = area
+    MapSizesCache[key] = area
 
     local wf = writefile or (syn and syn.writefile)
     if typeof(wf) == "function" then
         pcall(function()
-            local jsonStr = HttpService:JSONEncode(MapSizesCache)
+            local toSave: { [string]: number } = { [SPAWNS_SCHEMA_KEY] = 1 }
+            for k, v in pairs(MapSizesCache) do
+                toSave[k] = v
+            end
+            local jsonStr = HttpService:JSONEncode(toSave)
             wf(MAP_SIZES_FILE, jsonStr)
         end)
     end
 end
 
+local function Cross2D(o: Vector2, a: Vector2, b: Vector2): number
+    return (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X)
+end
+
+-- Проекция точек Spawns на плоскость XZ -> выпуклая оболочка (без самопересечений) + площадь по формуле шнуровки
 local function CalculateMapArea(mapModel: Instance): number?
-    local minX, maxX = math.huge, -math.huge
-    local minZ, maxZ = math.huge, -math.huge
-    local pointsCount = 0
+    local spawns = mapModel:FindFirstChild("Spawns")
+    if not spawns then return nil end
 
-    local container = mapModel:FindFirstChild("CoinContainer")
-    if container then
-        for _, child in ipairs(container:GetChildren()) do
-            local p: Vector3? = nil
-            if child:IsA("BasePart") then
-                p = child.Position
-            elseif child:IsA("Model") then
-                local prim = child.PrimaryPart or child:FindFirstChildWhichIsA("BasePart")
-                if prim then p = prim.Position end
-            end
-            if p then
-                pointsCount = pointsCount + 1
-                if p.X < minX then minX = p.X end
-                if p.X > maxX then maxX = p.X end
-                if p.Z < minZ then minZ = p.Z end
-                if p.Z > maxZ then maxZ = p.Z end
-            end
+    local sorted: { Vector2 } = {}
+    local function addPart(part: BasePart)
+        local p = part.Position
+        if p.X == p.X and p.Z == p.Z then
+            table.insert(sorted, Vector2.new(p.X, p.Z))
         end
     end
 
-    if pointsCount >= 4 and minX < maxX and minZ < maxZ then
-        local w = maxX - minX
-        local d = maxZ - minZ
-        return math.floor(w * d)
+    if spawns:IsA("BasePart") then
+        addPart(spawns)
     end
-
-    if mapModel:IsA("Model") then
-        local ok, cf, size = pcall(function() return (mapModel :: Model):GetBoundingBox() end)
-        if ok and size and size.X > 0 and size.Z > 0 then
-            return math.floor(size.X * size.Z)
+    for _, desc in ipairs(spawns:GetDescendants()) do
+        if desc:IsA("BasePart") then
+            addPart(desc)
         end
     end
 
-    return nil
+    if #sorted < 3 then return nil end
+
+    table.sort(sorted, function(a: Vector2, b: Vector2): boolean
+        if a.X ~= b.X then return a.X < b.X end
+        return a.Y < b.Y
+    end)
+
+    local unique: { Vector2 } = {}
+    for _, p in ipairs(sorted) do
+        local prev = unique[#unique]
+        if not prev or math.abs(p.X - prev.X) > 1e-3 or math.abs(p.Y - prev.Y) > 1e-3 then
+            table.insert(unique, p)
+        end
+    end
+
+    if #unique < 3 then return nil end
+
+    local lower: { Vector2 } = {}
+    for _, p in ipairs(unique) do
+        while #lower >= 2 and Cross2D(lower[#lower - 1], lower[#lower], p) <= 0 do
+            table.remove(lower)
+        end
+        table.insert(lower, p)
+    end
+
+    local upper: { Vector2 } = {}
+    for i = #unique, 1, -1 do
+        local p = unique[i]
+        while #upper >= 2 and Cross2D(upper[#upper - 1], upper[#upper], p) <= 0 do
+            table.remove(upper)
+        end
+        table.insert(upper, p)
+    end
+
+    table.remove(lower)
+    table.remove(upper)
+    for _, p in ipairs(upper) do
+        table.insert(lower, p)
+    end
+
+    local hullCount = #lower
+    if hullCount < 3 then return nil end
+
+    local sum = 0
+    for i = 1, hullCount do
+        local a = lower[i]
+        local b = lower[(i % hullCount) + 1]
+        sum = sum + (a.X * b.Y - b.X * a.Y)
+    end
+
+    local area = math.floor(math.abs(sum) * 0.5 + 0.5)
+    return (area > 0) and area or nil
 end
 
 local function RecordMapSizeIfNew(mapInstance: Instance)
-    task.spawn(function()
-        task.wait(2)
-        if IsTerminated or not mapInstance or not mapInstance.Parent then return end
-        local rawName = mapInstance.Name
-        if rawName == "" or rawName == "Workspace" or rawName == "Lobby" then return end
+    if IsTerminated or not mapInstance or not mapInstance.Parent then return end
+    local rawName = mapInstance.Name
+    if rawName == "" or rawName == "Workspace" or rawName == "Lobby" then return end
 
-        local lowerName = string.lower(rawName)
-        if MapSizesCache[lowerName] and MapSizesCache[lowerName] > 0 then
-            return
-        end
+    local key = NormalizeMapKey(rawName)
+    if key == "" or (MapSizesCache[key] and MapSizesCache[key] > 0) then
+        return
+    end
+
+    task.spawn(function()
+        local spawns = mapInstance:FindFirstChild("Spawns") or mapInstance:WaitForChild("Spawns", 10)
+        if not spawns or IsTerminated or not mapInstance.Parent then return end
+
+        -- Короткая пауза, чтобы все детали внутри Spawns гарантированно догрузились по сети
+        task.wait(1)
+        if IsTerminated or not mapInstance.Parent then return end
+        if MapSizesCache[key] and MapSizesCache[key] > 0 then return end
 
         local area = CalculateMapArea(mapInstance)
         if area and area > 0 then
             SaveMapSize(rawName, area)
-            print(string.format("[MM2 AIO] Новая карта '%s' замерена! Площадь XZ: %d кв. студов. Сохранено в %s", rawName, area, MAP_SIZES_FILE))
+            print(string.format("[MM2 AIO] Новая карта '%s' замерена по Spawns XZ: %d кв. студов. Сохранено в %s", rawName, area, MAP_SIZES_FILE))
             UpdateStatus(string.format("База карт: '%s' = %d студов", rawName, area), Color3.fromRGB(100, 255, 150))
         end
     end)
@@ -461,6 +525,20 @@ local function IsPlayerActuallyAlive(plr: Player): boolean
     return (deadStatus == false)
 end
 
+-- Безопасная swap-and-pop очистка отключенных соединений из массива ActiveConnections (O(1) на удаление)
+local function PruneActiveConnections()
+    local connIdx = 1
+    while connIdx <= #ActiveConnections do
+        local conn = ActiveConnections[connIdx]
+        if not conn or not conn.Connected then
+            ActiveConnections[connIdx] = ActiveConnections[#ActiveConnections]
+            ActiveConnections[#ActiveConnections] = nil
+        else
+            connIdx = connIdx + 1
+        end
+    end
+end
+
 local function AutoFarmCleanUp()
     table.clear(rt.touchedCoins)
     table.clear(rt.cachedCoins)
@@ -479,17 +557,7 @@ local function AutoFarmCleanUp()
     end
     rt.coinContainer = nil
 
-    -- Безопасная swap-and-pop очистка отключенных соединений из массива ActiveConnections (O(1) на удаление)
-    local connIdx = 1
-    while connIdx <= #ActiveConnections do
-        local conn = ActiveConnections[connIdx]
-        if not conn or not conn.Connected then
-            ActiveConnections[connIdx] = ActiveConnections[#ActiveConnections]
-            ActiveConnections[#ActiveConnections] = nil
-        else
-            connIdx = connIdx + 1
-        end
-    end
+    PruneActiveConnections()
 end
 
 -- === ПРОВЕРКА ЛИМИТА СУМКИ ===
@@ -573,7 +641,20 @@ end
 local CurrentMapInstance: Instance? = nil
 local CurrentMapSpawnPosition: Vector3? = nil
 local CurrentMapSafeY: number? = nil -- Высота сейф-зоны, вычисленная по карте в RegisterMap
+local CurrentMapCcConn: RBXScriptConnection? = nil
+local CurrentMapRemConn: RBXScriptConnection? = nil
 local candidateConnections: { [Instance]: { RBXScriptConnection } } = setmetatable({}, { __mode = "k" }) :: any
+
+local function DisconnectCurrentMapListeners()
+    if CurrentMapCcConn then
+        if CurrentMapCcConn.Connected then pcall(function() (CurrentMapCcConn :: RBXScriptConnection):Disconnect() end) end
+        CurrentMapCcConn = nil
+    end
+    if CurrentMapRemConn then
+        if CurrentMapRemConn.Connected then pcall(function() (CurrentMapRemConn :: RBXScriptConnection):Disconnect() end) end
+        CurrentMapRemConn = nil
+    end
+end
 
 -- Состояние safe-телепорта (одноразовый за раунд)
 local LastKnownLobbyPosition: Vector3? = nil
@@ -609,12 +690,15 @@ end
 local function CleanupMap(child: Instance)
     DisconnectCandidate(child)
     if CurrentMapInstance == child then
+        DisconnectCurrentMapListeners()
         CurrentMapInstance = nil
         CurrentMapSpawnPosition = nil
         CurrentMapSafeY = nil
         ResetSafeZoneState()
         rt.coinContainer = nil
         AutoFarmCleanUp()
+    else
+        PruneActiveConnections()
     end
 end
 
@@ -762,8 +846,10 @@ end
 
 local function RegisterMap(child: Instance, spawns: Instance?, container: Instance?)
     if CurrentMapInstance == child then return end
+    DisconnectCurrentMapListeners()
     CurrentMapInstance = child
     DisconnectCandidate(child)
+    PruneActiveConnections()
 
     CurrentMapSpawnPosition = nil
     local s = spawns or child:FindFirstChild("Spawns")
@@ -776,15 +862,16 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
         if ok and cf then CurrentMapSpawnPosition = cf.Position end
     end
 
+    local ccConn: RBXScriptConnection? = nil
     if container then
         rt.coinContainer = container
         if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
             PopulateCoins()
         end
     else
-        local ccConn: RBXScriptConnection? = nil
         ccConn = child.ChildAdded:Connect(function(newChild)
             if newChild.Name == "CoinContainer" then
+                if CurrentMapCcConn == ccConn then CurrentMapCcConn = nil end
                 if ccConn then ccConn:Disconnect(); ccConn = nil end
                 rt.coinContainer = newChild
                 if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
@@ -792,11 +879,13 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
                 end
             end
         end)
+        CurrentMapCcConn = ccConn
         if ccConn then RegisterConnection(ccConn) end
 
         task.spawn(function()
             local cc = child:WaitForChild("CoinContainer", 15)
             if cc and not rt.coinContainer and CurrentMapInstance == child then
+                if CurrentMapCcConn == ccConn then CurrentMapCcConn = nil end
                 if ccConn then ccConn:Disconnect(); ccConn = nil end
                 rt.coinContainer = cc
                 if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
@@ -809,10 +898,14 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
     local remConn: RBXScriptConnection? = nil
     remConn = child.AncestryChanged:Connect(function(_, parent)
         if not parent or parent ~= Workspace then
+            if CurrentMapRemConn == remConn then CurrentMapRemConn = nil end
             if remConn then remConn:Disconnect(); remConn = nil end
+            if CurrentMapCcConn == ccConn then CurrentMapCcConn = nil end
+            if ccConn then ccConn:Disconnect(); ccConn = nil end
             CleanupMap(child)
         end
     end)
+    CurrentMapRemConn = remConn
     if remConn then RegisterConnection(remConn) end
 
     -- Автоматическое измерение и сохранение размера новой карты
@@ -1576,16 +1669,47 @@ local function SetupBagParser()
                 bindToCurrencyBag(bag)
             end
 
-            local containerAddConn = container.ChildAdded:Connect(function(child)
+            local containerAddConn: RBXScriptConnection? = nil
+            local containerRemConn: RBXScriptConnection? = nil
+            local containerAncConn: RBXScriptConnection? = nil
+
+            local function disconnectContainer()
+                hookedContainers[container] = nil
+                if containerAddConn then
+                    if containerAddConn.Connected then pcall(function() (containerAddConn :: RBXScriptConnection):Disconnect() end) end
+                    containerAddConn = nil
+                end
+                if containerRemConn then
+                    if containerRemConn.Connected then pcall(function() (containerRemConn :: RBXScriptConnection):Disconnect() end) end
+                    containerRemConn = nil
+                end
+                if containerAncConn then
+                    if containerAncConn.Connected then pcall(function() (containerAncConn :: RBXScriptConnection):Disconnect() end) end
+                    containerAncConn = nil
+                end
+                for _, child in ipairs(container:GetChildren()) do
+                    DisconnectBag(child)
+                end
+                PruneActiveConnections()
+            end
+
+            containerAddConn = container.ChildAdded:Connect(function(child)
                 if IsTerminated then return end
                 bindToCurrencyBag(child)
             end)
-            RegisterConnection(containerAddConn)
+            if containerAddConn then RegisterConnection(containerAddConn) end
 
-            local containerRemConn = container.ChildRemoved:Connect(function(child)
+            containerRemConn = container.ChildRemoved:Connect(function(child)
                 DisconnectBag(child)
             end)
-            RegisterConnection(containerRemConn)
+            if containerRemConn then RegisterConnection(containerRemConn) end
+
+            containerAncConn = container.AncestryChanged:Connect(function(_, parent)
+                if not parent or not container:IsDescendantOf(game) then
+                    disconnectContainer()
+                end
+            end)
+            if containerAncConn then RegisterConnection(containerAncConn) end
         end
 
         local function scanAndHookContainers(mainGui: Instance)
@@ -1621,6 +1745,7 @@ local function SetupBagParser()
             if mainGuiDescConn then
                 mainGuiDescConn:Disconnect()
                 mainGuiDescConn = nil
+                PruneActiveConnections()
             end
             mainGuiDescConn = mainGui.DescendantAdded:Connect(function(desc)
                 if IsTerminated then return end
@@ -3935,8 +4060,8 @@ end))
 local LastVoteSession = ""
 
 local function GetMapPriority(mapName: string): (number, boolean)
-    local lowerMap = string.lower(mapName)
-    local cachedArea = MapSizesCache[lowerMap]
+    local key = NormalizeMapKey(mapName)
+    local cachedArea = MapSizesCache[key]
 
     -- 1. Если карта ещё не исследована и отсутствует в базе:
     -- Назначаем наивысший приоритет (меньше 0), чтобы скрипт голосовал за неё
@@ -3944,7 +4069,7 @@ local function GetMapPriority(mapName: string): (number, boolean)
         return -1, false
     end
 
-    -- 2. Если карта известна: приоритет равен её площади (чем меньше площадь XZ, тем выше приоритет)
+    -- 2. Если карта известна: приоритет равен её площади Spawns XZ (чем меньше площадь, тем выше приоритет)
     return cachedArea, true
 end
 
