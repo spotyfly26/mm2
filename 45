@@ -271,9 +271,10 @@ local function CreateButton(text: string, color: Color3, pos: UDim2, size: UDim2
     return btn
 end
 
-local BtnExport = CreateButton("💾 ЭКСПОРТ ЛОГА (В ФАЙЛ)", Color3.fromRGB(40, 130, 200), UDim2.new(0, 0, 0, 0), UDim2.new(0.46, -2, 1, 0))
-local BtnCopy = CreateButton("📋 СКОПИРОВАТЬ", Color3.fromRGB(90, 60, 160), UDim2.new(0.46, 2, 0, 0), UDim2.new(0.36, -2, 1, 0))
-local BtnClear = CreateButton("🗑 ОЧИСТИТЬ", Color3.fromRGB(70, 70, 80), UDim2.new(0.82, 2, 0, 0), UDim2.new(0.18, -2, 1, 0))
+local BtnExport = CreateButton("💾 ЭКСПОРТ", Color3.fromRGB(40, 130, 200), UDim2.new(0, 0, 0, 0), UDim2.new(0.26, -2, 1, 0))
+local BtnCopy = CreateButton("📋 БУФЕР", Color3.fromRGB(90, 60, 160), UDim2.new(0.26, 2, 0, 0), UDim2.new(0.24, -2, 1, 0))
+local BtnCheckAttrs = CreateButton("🔍 АТРИБУТЫ", Color3.fromRGB(35, 125, 115), UDim2.new(0.50, 2, 0, 0), UDim2.new(0.28, -2, 1, 0))
+local BtnClear = CreateButton("🗑 ОЧИСТИТЬ", Color3.fromRGB(70, 70, 80), UDim2.new(0.78, 2, 0, 0), UDim2.new(0.22, -2, 1, 0))
 
 -- Консоль вывода событий
 local ConsoleFrame = Instance.new("Frame")
@@ -556,6 +557,65 @@ local function CopyLogsToClipboard(sourceBtn: TextButton?): boolean
     return copied
 end
 
+local function CheckAttributesDiagnostic()
+    Log("🔍 === ДИАГНОСТИКА АТРИБУТОВ (GetAttributes) ===", "PLAYER")
+    print("=== АТРИБУТЫ LOCALPLAYER ===")
+
+    local pAttrs = LocalPlayer:GetAttributes()
+    local pCount = 0
+    for k, v in pairs(pAttrs) do
+        pCount = pCount + 1
+        local msg = string.format("LocalPlayer Attr: %s = %s (%s)", tostring(k), tostring(v), typeof(v))
+        print(msg)
+        Log("👤 " .. msg, "PLAYER")
+    end
+    if pCount == 0 then
+        local msg = "У LocalPlayer нет никаких атрибутов (пусто)!"
+        print(msg)
+        Log("👤 " .. msg, "DATA")
+    end
+
+    print("=== АТРИБУТЫ CHARACTER ===")
+    local char = LocalPlayer.Character
+    if char then
+        local cAttrs = char:GetAttributes()
+        local cCount = 0
+        for k, v in pairs(cAttrs) do
+            cCount = cCount + 1
+            local msg = string.format("Character Attr: %s = %s (%s)", tostring(k), tostring(v), typeof(v))
+            print(msg)
+            Log("🥋 " .. msg, "PLAYER")
+        end
+        if cCount == 0 then
+            local msg = "У Character нет никаких атрибутов (пусто)!"
+            print(msg)
+            Log("🥋 " .. msg, "DATA")
+        end
+    else
+        local msg = "Character отсутствует (nil)!"
+        print(msg)
+        Log("🥋 " .. msg, "WARN")
+    end
+
+    -- Дополнительная проверка других игроков
+    local otherPlayersWithAttrs = 0
+    for _, otherPlr in ipairs(Players:GetPlayers()) do
+        if otherPlr ~= LocalPlayer then
+            local oAttrs = otherPlr:GetAttributes()
+            if next(oAttrs) ~= nil then
+                otherPlayersWithAttrs = otherPlayersWithAttrs + 1
+                for k, v in pairs(oAttrs) do
+                    Log(string.format("👥 [%s Attr] %s = %s (%s)", otherPlr.Name, tostring(k), tostring(v), typeof(v)), "PLAYER")
+                end
+            end
+        end
+    end
+    if otherPlayersWithAttrs == 0 then
+        Log("👥 У других игроков на сервере также нет атрибутов на объекте Player", "DATA")
+    end
+    Log("🔍 =============================================", "PLAYER")
+end
+
 local function BindButton(btn: TextButton, callback: () -> ())
     local debounce = false
     local function fire()
@@ -575,6 +635,7 @@ end)
 BindButton(CopyTitleBtn, function()
     CopyLogsToClipboard(CopyTitleBtn)
 end)
+BindButton(BtnCheckAttrs, CheckAttributesDiagnostic)
 
 -- =====================================================================
 -- СЕРИАЛИЗАТОР АРГУМЕНТОВ РЕМОУТОВ
