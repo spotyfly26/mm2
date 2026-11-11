@@ -53,6 +53,11 @@ end)
 
 local HttpService = game:GetService("HttpService")
 
+-- Объявляем заранее: функции ниже (RecordMapSizeIfNew и др.) должны видеть локальные переменные,
+-- а не глобальные nil (иначе проверка завершения не работает, а вызов UpdateStatus падает с ошибкой)
+local IsTerminated = false -- Флаг полного завершения скрипта
+local UpdateStatus: (text: string, color: Color3?) -> () = function() end
+
 -- === БАЗА ДАННЫХ РАЗМЕРОВ КАРТ (АВТОМАТИЧЕСКОЕ ОБУЧЕНИЕ) ===
 local MAP_SIZES_FILE = "mm2_map_sizes.json"
 local MapSizesCache: { [string]: number } = {}
@@ -215,7 +220,8 @@ local SETTINGS = {
     TwinAvoidEnabled = true, -- Умное разделение зон фарма с твинком (без гонок за одной монетой)
     TwinAvoidRadius = 30, -- Компактная сфера влияния твинка (студы)
     UnderfloorOffset = 3.8, -- Смещение под карту (студы ниже монеты)
-    SafeUnderfloorY = 200, -- Безопасная глубина сейф-зоны до спавна монет
+    SafeUnderfloorY = 200, -- Запасная высота сейф-зоны (используется, только если не удалось вычислить низ карты в RegisterMap)
+    SafeZoneMargin = 15, -- Насколько студов ниже самой нижней точки карты прячемся в сейф-зоне
     AutoRejoinEnabled = (initialProfile and initialProfile.AutoRejoinEnabled == true) or false,
     RejoinTime = (initialProfile and typeof(initialProfile.RejoinTime) == "number" and initialProfile.RejoinTime > 0 and initialProfile.RejoinTime) or 5400,
     RejoinServerMode = (initialProfile and (initialProfile.RejoinServerMode == "Same" or initialProfile.RejoinServerMode == "Random") and initialProfile.RejoinServerMode) or "Same",
@@ -273,7 +279,6 @@ local CurrentRoundCoins = 0
 local ActiveCurrencyName = "Coin"
 local BagCoinCount = 0
 local HasVoted = false
-local IsTerminated = false -- Флаг полного завершения скрипта
 
 -- Список всех активных соединений (RBXScriptConnection) для гарантированного отключения
 local ActiveConnections: { RBXScriptConnection } = {}
@@ -338,15 +343,12 @@ local function ChangeState(newState: string)
     end
 end
 
--- Объявление UpdateStatus для логирования до инициализации UI
-local UpdateStatus: (text: string, color: Color3?) -> () = function() end
-
 function rt:Character() return self.player.Character or self.player.CharacterAdded:Wait() end
 function rt:GetCharacterLoaded() repeat task.wait(0.02) until rt:Character() ~= nil end
 
 -- === ОПТИМИЗИРОВАННЫЙ NOCLIP ===
 local isVotingNoclip = false
-local isSafeZoneNoclip = false
+local safeNoclipUntil = 0 -- os.clock()-метка: ноклип сейф-зоны активен до этого момента (без флага, который нужно сбрасывать отдельным потоком)
 
 local function updateBodyPartsCache()
     table.clear(rt.cachedBodyParts)
@@ -361,7 +363,7 @@ end
 
 RegisterConnection(RunService.Stepped:Connect(function()
     if IsTerminated then return end
-    if isVotingNoclip or isSafeZoneNoclip or (SETTINGS.AutoFarmEnabled and CurrentState == State.Action) then
+    if isVotingNoclip or (SETTINGS.AutoFarmEnabled and CurrentState == State.Action) or os.clock() < safeNoclipUntil then
         if #rt.cachedBodyParts == 0 then updateBodyPartsCache() end
         for _, part in ipairs(rt.cachedBodyParts) do
             if part and part.Parent and part.CanCollide then
@@ -374,50 +376,64 @@ end))
 -- =====================================================================
 -- ПОИСК СЕТЕВЫХ СОБЫТИЙ (REMOTE EVENT FINDER)
 -- =====================================================================
+-- Кэш найденных ремоутов (положительные результаты живут, пока ремоут в дереве; "не найден" помним 30 с,
+-- чтобы не сканировать весь ReplicatedStorage при каждом вызове)
+local RemoteCache: { [string]: RemoteEvent } = {}
+local RemoteMissUntil: { [string]: number } = {}
+
 local function FindRemoteEvent(name: string): RemoteEvent?
+    local cached = RemoteCache[name]
+    if cached and cached.Parent then return cached end
+    RemoteCache[name] = nil
+
+    local missUntil = RemoteMissUntil[name]
+    if missUntil and os.clock() < missUntil then return nil end
+
+    local found: RemoteEvent? = nil
     local direct = ReplicatedStorage:FindFirstChild(name)
-    if direct and direct:IsA("RemoteEvent") then return direct end
-    local deep = ReplicatedStorage:FindFirstChild(name, true)
-    if deep and deep:IsA("RemoteEvent") then return deep end
-    for _, item in ipairs(ReplicatedStorage:GetDescendants()) do
-        if item:IsA("RemoteEvent") and item.Name == name then
-            return item
+    if direct and direct:IsA("RemoteEvent") then
+        found = direct
+    else
+        local deep = ReplicatedStorage:FindFirstChild(name, true)
+        if deep and deep:IsA("RemoteEvent") then
+            found = deep
+        else
+            for _, item in ipairs(ReplicatedStorage:GetDescendants()) do
+                if item:IsA("RemoteEvent") and item.Name == name then
+                    found = item
+                    break
+                end
+            end
         end
     end
-    return nil
+
+    if found then
+        RemoteCache[name] = found
+        RemoteMissUntil[name] = nil
+    else
+        RemoteMissUntil[name] = os.clock() + 30
+    end
+    return found
 end
 
 -- Сетевые кэши состояния раунда и игроков
 local PlayerRolesCache: { [string]: string } = {}
 local PlayerAliveCache: { [string]: boolean } = {} -- true = мертв, false = жив
 
--- Проверка статуса смерти игрока:
+-- Проверка статуса смерти игрока (в игре существует только атрибут/поле Dead):
 -- true  -> мертв / не в раунде в любом случае
 -- false -> полноценно жив в раунде
 -- nil   -> таблица не обновилась или персонаж в лобби
 local function GetPlayerDeadStatus(plr: Player?): boolean?
     local target = plr or LocalPlayer
 
-    -- 1. Проверка серверного атрибута (Dead / Death / dead) на объекте Player
+    -- 1. Атрибут Dead на объекте Player (если игра его вешает)
     local attrDead = target:GetAttribute("Dead")
-    if attrDead == nil then attrDead = target:GetAttribute("Death") end
-    if attrDead == nil then attrDead = target:GetAttribute("dead") end
     if attrDead ~= nil then
         return (attrDead == true)
     end
 
-    -- 2. Проверка атрибута на модели Character
-    local char = target.Character
-    if char then
-        local cAttr = char:GetAttribute("Dead")
-        if cAttr == nil then cAttr = char:GetAttribute("Death") end
-        if cAttr == nil then cAttr = char:GetAttribute("dead") end
-        if cAttr ~= nil then
-            return (cAttr == true)
-        end
-    end
-
-    -- 3. Проверка серверного сетевого кэша PlayerAliveCache (RoundStart / PlayerDataChanged)
+    -- 2. Серверный сетевой кэш PlayerAliveCache (RoundStart / PlayerDataChanged)
     local cached = PlayerAliveCache[target.Name]
     if cached ~= nil then
         return cached
@@ -429,14 +445,7 @@ end
 local function HasAssignedRole(plr: Player?): boolean
     local target = plr or LocalPlayer
     local role = PlayerRolesCache[target.Name]
-    if role and role ~= "" and role ~= "nil" then
-        return true
-    end
-    local rAttr = target:GetAttribute("Role") or (target.Character and target.Character:GetAttribute("Role"))
-    if rAttr and rAttr ~= "" and rAttr ~= "nil" then
-        return true
-    end
-    return false
+    return (role ~= nil and role ~= "" and role ~= "nil")
 end
 
 local function IsPlayerActuallyAlive(plr: Player): boolean
@@ -563,7 +572,21 @@ end
 -- =====================================================================
 local CurrentMapInstance: Instance? = nil
 local CurrentMapSpawnPosition: Vector3? = nil
+local CurrentMapSafeY: number? = nil -- Высота сейф-зоны, вычисленная по карте в RegisterMap
 local candidateConnections: { [Instance]: { RBXScriptConnection } } = setmetatable({}, { __mode = "k" }) :: any
+
+-- Состояние safe-телепорта (одноразовый за раунд)
+local LastKnownLobbyPosition: Vector3? = nil
+local safeZoneTaskRunning = false
+local safeZoneDone = false -- true после первой попытки в этом раунде: повторно сейф-зона не запускается
+local safeZoneGen = 0 -- поколение: устаревший поток не трогает флаги нового раунда
+
+local function ResetSafeZoneState()
+    safeZoneGen = safeZoneGen + 1
+    safeZoneTaskRunning = false
+    safeZoneDone = false
+    LastKnownLobbyPosition = nil
+end
 
 local function DisconnectCandidate(child: Instance)
     local conns = candidateConnections[child]
@@ -588,6 +611,8 @@ local function CleanupMap(child: Instance)
     if CurrentMapInstance == child then
         CurrentMapInstance = nil
         CurrentMapSpawnPosition = nil
+        CurrentMapSafeY = nil
+        ResetSafeZoneState()
         rt.coinContainer = nil
         AutoFarmCleanUp()
     end
@@ -614,50 +639,86 @@ local function GetMapSpawnPosition(): Vector3?
     return nil
 end
 
--- === МЕХАНИКА SAFE ТЕЛЕПОРТА (ОТДЕЛЬНЫЙ ЦИКЛ ПОСЛЕ ГОЛОСОВАНИЯ) ===
-local LastKnownLobbyPosition: Vector3? = nil
-local safeZoneTaskRunning = false
+-- === ВЫЧИСЛЕНИЕ ВЫСОТЫ SAFE-ЗОНЫ ПО КАРТЕ (один раз при RegisterMap) ===
+-- Safe-зона = под самой нижней точкой карты (минус SafeZoneMargin). Монеты на этот момент ещё не заспавнены,
+-- поэтому ориентируемся только на саму карту. SafeUnderfloorY остаётся запасным значением.
+local function ComputeMapSafeY(map: Instance): number?
+    local minY: number? = nil
 
+    if map:IsA("Model") then
+        local ok, cf, size = pcall(function() return (map :: Model):GetBoundingBox() end)
+        if ok and cf and size then
+            minY = cf.Position.Y - size.Y / 2
+        end
+    else
+        -- Folder: у него нет GetBoundingBox, обходим части один раз (с паузами, чтобы не подвесить клиент)
+        local n = 0
+        for _, d in ipairs(map:GetDescendants()) do
+            if d:IsA("BasePart") then
+                local y = d.Position.Y - d.Size.Y / 2
+                if not minY or y < minY then minY = y end
+            end
+            n = n + 1
+            if n % 400 == 0 then task.wait() end
+        end
+    end
+
+    if not minY then return nil end
+
+    -- Защита от выбросов (например, огромная деталь далеко внизу): не глубже 300 студов от спавна
+    -- и не ниже порога уничтожения упавших деталей
+    local spawnY = (CurrentMapSpawnPosition and CurrentMapSpawnPosition.Y) or minY
+    local y = minY - (SETTINGS.SafeZoneMargin or 15)
+    y = math.max(y, spawnY - 300)
+    y = math.max(y, Workspace.FallenPartsDestroyHeight + 50)
+    return y
+end
+
+-- === МЕХАНИКА SAFE ТЕЛЕПОРТА (ОДНОРАЗОВО ЗА РАУНД, ЗАПУСК ИЗ RegisterMap) ===
+-- Порядок в MM2: карта загружена (RegisterMap) -> через несколько секунд игроков телепортирует на карту ->
+-- роли/таргеты и отсчёт ~10 с -> спавн монет и выдача оружия.
+-- Задача: сразу после ТП на карту спрятаться под карту, чтобы к спавну монет/оружия к нам не подошли.
+-- Повторный запуск в том же раунде запрещён (safeZoneDone), иначе ТП к первой монете принимается
+-- за "ТП на карту" и возвращает нас обратно в сейф-зону.
 local function StartSafeZoneWatch()
-    if safeZoneTaskRunning or not SETTINGS.AutoFarmEnabled or IsTerminated then return end
-
-    local char = LocalPlayer.Character or rt:Character()
-    local hrp = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart") :: BasePart?)
-    if not hrp then return end
-
-    -- Фиксируем позицию персонажа в лобби
-    local lobbyPos = hrp.Position
-    LastKnownLobbyPosition = lobbyPos
+    if safeZoneTaskRunning or safeZoneDone or IsTerminated or not SETTINGS.AutoFarmEnabled then return end
     safeZoneTaskRunning = true
+    local gen = safeZoneGen
 
     task.spawn(function()
-        local watchStart = tick()
-        -- Отслеживаем перемещение более чем на 100 студов от точки в лобби (таймаут 15 сек)
-        while not IsTerminated and SETTINGS.AutoFarmEnabled and safeZoneTaskRunning and (tick() - watchStart < 15) do
-            task.wait(0.05)
+        local lobbyPos: Vector3? = nil
+        local detected = false
+        local watchStart = os.clock()
 
-            local currentChar = LocalPlayer.Character
-            local currentHrp = currentChar and (currentChar.PrimaryPart or currentChar:FindFirstChild("HumanoidRootPart") :: BasePart?)
-            local currentHum = currentChar and currentChar:FindFirstChildOfClass("Humanoid")
+        -- Опрос 20 раз/с (без Changed-сигналов на физике): первая точка = позиция в лобби на момент загрузки карты
+        while not IsTerminated and SETTINGS.AutoFarmEnabled and gen == safeZoneGen and (os.clock() - watchStart < 25) do
+            local c = LocalPlayer.Character
+            local h = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart") :: BasePart?)
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
 
-            if not currentHrp or not currentHum or currentHum.Health <= 0 then
-                continue
+            if h and hum and hum.Health > 0 then
+                if not lobbyPos then
+                    lobbyPos = h.Position
+                    LastKnownLobbyPosition = lobbyPos
+                elseif (h.Position - lobbyPos).Magnitude > 100 then
+                    detected = true
+                    break
+                end
             end
+            task.wait(0.05)
+        end
 
-            -- Проверяем: телепортировало ли нас на карту раунда (> 100 студов)
-            if (currentHrp.Position - lobbyPos).Magnitude > 100 then
-                UpdateStatus("Сейф-зона: ТП на карту обнаружен, пауза (0.3с)...", Color3.fromRGB(130, 200, 255))
-                task.wait(0.3)
+        if detected and not IsTerminated and SETTINGS.AutoFarmEnabled and gen == safeZoneGen then
+            UpdateStatus("Сейф-зона: ТП на карту обнаружен, пауза (0.3с)...", Color3.fromRGB(130, 200, 255))
+            task.wait(0.3)
 
-                if IsTerminated or not SETTINGS.AutoFarmEnabled or not safeZoneTaskRunning then break end
+            local c = LocalPlayer.Character
+            local h = c and (c.PrimaryPart or c:FindFirstChild("HumanoidRootPart") :: BasePart?)
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
 
-                currentChar = LocalPlayer.Character
-                currentHrp = currentChar and (currentChar.PrimaryPart or currentChar:FindFirstChild("HumanoidRootPart") :: BasePart?)
-                currentHum = currentChar and currentChar:FindFirstChildOfClass("Humanoid")
-                if not currentHrp or not currentHum or currentHum.Health <= 0 then break end
-
-                -- Гарантированный ноклип для сейф-зоны
-                isSafeZoneNoclip = true
+            if c and h and hum and hum.Health > 0 and not IsTerminated and SETTINGS.AutoFarmEnabled and gen == safeZoneGen then
+                -- Гарантированный ноклип на время перехода (дальше его держит State.Action)
+                safeNoclipUntil = os.clock() + 2
                 updateBodyPartsCache()
                 for _, part in ipairs(rt.cachedBodyParts) do
                     if part and part.Parent then
@@ -665,38 +726,37 @@ local function StartSafeZoneWatch()
                     end
                 end
 
-                -- Точка сейф-зоны под полом текущей позиции на карте
-                local safeY = SETTINGS.SafeUnderfloorY or 200
-                local safePos = Vector3.new(currentHrp.Position.X, safeY, currentHrp.Position.Z)
+                local safeY = CurrentMapSafeY or SETTINGS.SafeUnderfloorY or 200
+                local safePos = Vector3.new(h.Position.X, safeY, h.Position.Z)
 
-                currentHum.PlatformStand = true
+                hum.PlatformStand = true
 
-                local bv = currentHrp:FindFirstChild("FarmVelocity") or Instance.new("BodyVelocity")
+                local bv = h:FindFirstChild("FarmVelocity") or Instance.new("BodyVelocity")
                 bv.Name = "FarmVelocity"
                 bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
                 bv.Velocity = Vector3.zero
-                bv.Parent = currentHrp
+                bv.Parent = h
 
-                local bg = currentHrp:FindFirstChild("FarmGyro") or Instance.new("BodyGyro")
+                local bg = h:FindFirstChild("FarmGyro") or Instance.new("BodyGyro")
                 bg.Name = "FarmGyro"
                 bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
                 bg.CFrame = CFrame.new(safePos)
                 bg.P = 3000
-                bg.Parent = currentHrp
+                bg.Parent = h
 
-                currentHrp.AssemblyLinearVelocity = Vector3.zero
-                currentHrp.AssemblyAngularVelocity = Vector3.zero
-                currentChar:PivotTo(CFrame.new(safePos))
+                h.AssemblyLinearVelocity = Vector3.zero
+                h.AssemblyAngularVelocity = Vector3.zero
+                c:PivotTo(CFrame.new(safePos))
 
                 UpdateStatus("Сейф-зона: Персонаж укрыт под картой", Color3.fromRGB(120, 255, 120))
-                break
             end
         end
 
-        safeZoneTaskRunning = false
-        -- Удерживаем ноклип сейф-зоны ещё 1.5 секунды, пока основной стейт State.Action не подхватит управление
-        task.wait(1.5)
-        isSafeZoneNoclip = false
+        -- Одна попытка за раунд (успех, таймаут или отключённый фарм — не важно): повторно не армируем
+        if gen == safeZoneGen then
+            safeZoneDone = true
+            safeZoneTaskRunning = false
+        end
     end)
 end
 
@@ -704,7 +764,6 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
     if CurrentMapInstance == child then return end
     CurrentMapInstance = child
     DisconnectCandidate(child)
-    StartSafeZoneWatch()
 
     CurrentMapSpawnPosition = nil
     local s = spawns or child:FindFirstChild("Spawns")
@@ -758,6 +817,17 @@ local function RegisterMap(child: Instance, spawns: Instance?, container: Instan
 
     -- Автоматическое измерение и сохранение размера новой карты
     RecordMapSizeIfNew(child)
+
+    -- Высота сейф-зоны по карте (до спавна монет и до ТП игроков, считается один раз за карту)
+    task.spawn(function()
+        local y = ComputeMapSafeY(child)
+        if CurrentMapInstance == child then
+            CurrentMapSafeY = y
+        end
+    end)
+
+    -- Одноразовый safe-телепорт: ждём ТП игрока из лобби на эту карту
+    StartSafeZoneWatch()
 end
 
 local function InspectMapCandidate(child: Instance)
@@ -852,21 +922,27 @@ function rt:CheckIfGameInProgress(): boolean
 end
 
 -- Вспомогательная быстрая проверка видимости сумки игрока (fallback при старте скрипта посреди раунда)
+local cachedBagContainer: Instance? = nil -- кэш контейнера сумки: путь ищем один раз, а не при каждом вызове
+
 local function CheckBagGuiVisible(): boolean
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false end
     local mainGui = playerGui:FindFirstChild("MainGUI")
     if not mainGui or not mainGui:IsA("ScreenGui") or not mainGui.Enabled then return false end
 
-    local gameObj = mainGui:FindFirstChild("Game")
-    local gameBags = gameObj and gameObj:FindFirstChild("CoinBags")
-    local dock = mainGui:FindFirstChild("Lobby") and mainGui.Lobby:FindFirstChild("Dock")
-    local dockBags = dock and dock:FindFirstChild("CoinBags")
+    local bagContainer = cachedBagContainer
+    if not bagContainer or not bagContainer:IsDescendantOf(mainGui) then
+        local gameObj = mainGui:FindFirstChild("Game")
+        local gameBags = gameObj and gameObj:FindFirstChild("CoinBags")
+        local dock = mainGui:FindFirstChild("Lobby") and mainGui.Lobby:FindFirstChild("Dock")
+        local dockBags = dock and dock:FindFirstChild("CoinBags")
 
-    local bagContainer = (gameBags and gameBags:FindFirstChild("Container")) or (dockBags and dockBags:FindFirstChild("Container"))
-    if not bagContainer then
-        local anyBags = mainGui:FindFirstChild("CoinBags", true)
-        bagContainer = anyBags and anyBags:FindFirstChild("Container")
+        bagContainer = (gameBags and gameBags:FindFirstChild("Container")) or (dockBags and dockBags:FindFirstChild("Container"))
+        if not bagContainer then
+            local anyBags = mainGui:FindFirstChild("CoinBags", true)
+            bagContainer = anyBags and anyBags:FindFirstChild("Container")
+        end
+        cachedBagContainer = bagContainer
     end
 
     if not bagContainer or not bagContainer:IsA("GuiObject") or not bagContainer.Visible then
@@ -906,7 +982,7 @@ function rt:CheckIfPlayerWasInARound(): boolean
     local hum = char and char:FindFirstChildOfClass("Humanoid")
     if not hum or hum.Health <= 0 then return false end
 
-    -- 1. Проверка серверного статуса Dead (атрибут Dead/Death или сетевой кэш):
+    -- 1. Проверка серверного статуса Dead (атрибут Dead или сетевой кэш PlayerAliveCache):
     local deadStatus = GetPlayerDeadStatus(LocalPlayer)
     if deadStatus == true then
         -- true = мёртв / не в раунде в любом случае
@@ -1002,7 +1078,6 @@ local function SetupRemoteHooks()
                     end
                 end
             end
-            StartSafeZoneWatch()
         end))
     end
 
@@ -1012,8 +1087,7 @@ local function SetupRemoteHooks()
             if IsTerminated then return end
             table.clear(PlayerAliveCache)
             table.clear(PlayerRolesCache)
-            LastKnownLobbyPosition = nil
-            safeZoneTaskRunning = false
+            ResetSafeZoneState()
             if CurrentState == State.Action then
                 ChangeState(State.WaitingForRoundEnd)
             end
@@ -1697,13 +1771,20 @@ local function SetupInventoryTokensWatcher()
         -- Первая попытка при старте
         tryHook()
 
-        -- Спокойный опрос раз в 5 секунд:
-        -- 1. Если ссылка уже есть и жива — моментально пропускает (0% CPU).
+        -- Опрос с нарастающей паузой:
+        -- 1. Если ссылка уже есть и жива — моментально пропускает (0% CPU), пауза 5 с.
         -- 2. Если лейбл удалили/пересоздали (смена раунда) — тихо находит новую ссылку и вешает реактивный сигнал.
+        -- 3. Если лейбла нет совсем (ивент закончился / путь изменился) — пауза растёт 5 → 10 → 20 → 30 с,
+        --    чтобы не гонять рекурсивный поиск по PlayerGui каждые 5 секунд впустую.
+        local delay = 5
         while not IsTerminated do
-            task.wait(5)
-            if not cachedTokensLabel or not cachedTokensLabel.Parent or not cachedTokensLabel:IsDescendantOf(game) then
-                tryHook()
+            task.wait(delay)
+            if cachedTokensLabel and cachedTokensLabel.Parent and cachedTokensLabel:IsDescendantOf(game) then
+                delay = 5
+            elseif tryHook() then
+                delay = 5
+            else
+                delay = math.min(delay * 2, 30)
             end
         end
     end)
@@ -1957,7 +2038,9 @@ end
 -- =====================================================================
 -- НОВАЯ ЛОГИКА ПРЕДВАРИТЕЛЬНОЙ ЗАЧИСТКИ (PreRoundKillChain)
 -- =====================================================================
-local function PreRoundKillChain()
+local killChainActive = false -- защита от одновременного запуска нескольких цепочек зачистки
+
+local function RunKillChain()
     if not RoundInProgress() or not rt:CheckIfPlayerWasInARound() then return end
 
     local knife = InspectAndEquipKnife()
@@ -2205,6 +2288,18 @@ local function PreRoundKillChain()
     -- Гарантированное отключение всех слушателей зачистки и возврат ножа в рюкзак
     cleanupChain()
     task.wait(0.15)
+end
+
+-- Обёртка: одна активная цепочка зачистки за раз (ActionState и кнопка режима могли запустить две —
+-- тогда ChangeTarget обрабатывался бы дважды, а TurboKill бил бы дважды)
+local function PreRoundKillChain()
+    if killChainActive then return end
+    killChainActive = true
+    local ok, err = pcall(RunKillChain)
+    killChainActive = false
+    if not ok then
+        warn("[MM2 AIO] PreRoundKillChain error: " .. tostring(err))
+    end
 end
 
 -- =====================================================================
@@ -3085,6 +3180,22 @@ local function resetStats()
     updateStatsDisplay()
 end
 
+-- Снимаем с персонажа все удерживающие объекты скрипта (фарм / сейф-зона / голосование),
+-- иначе при выключении фарма BodyVelocity с силой 9e9 так и держит персонажа в воздухе
+local function ReleaseCharacterMovers()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hrp then
+        for _, name in ipairs({"FarmVelocity", "FarmGyro", "VoteHover", "VoteGyro"}) do
+            local obj = hrp:FindFirstChild(name)
+            if obj then obj:Destroy() end
+        end
+    end
+    if hum then hum.PlatformStand = false end
+end
+
 -- Включение / выключение автофарма
 BindClick(BtnFarm, function()
     SETTINGS.AutoFarmEnabled = not SETTINGS.AutoFarmEnabled
@@ -3099,8 +3210,10 @@ BindClick(BtnFarm, function()
         resetStats()
         CurrentState = State.WaitingForRound
         UnequipKnife()
+        ResetSafeZoneState()
+        safeNoclipUntil = 0
+        ReleaseCharacterMovers()
         UpdateStatus("Фарм остановлен", Color3.fromRGB(200, 100, 100))
-        if hum then hum.PlatformStand = false end
     else
         StatsData.StartTime = tick()
         CurrentRoundCoins = 0
@@ -3351,10 +3464,14 @@ local function applyPotatoMode()
         pcall(function() sethiddenproperty(Lighting, "Technology", 2) end)
 
         task.spawn(function()
+            -- Обход большой карты порциями: без пауз цикл по тысячам деталей подвешивает клиент на сотни мс
             for _, v in ipairs(Lighting:GetDescendants()) do makePartPotato(v) end
+            local processed = 0
             for _, v in ipairs(Workspace:GetDescendants()) do
                 makePartPotato(v)
                 if not SETTINGS.PotatoMode or IsTerminated then break end
+                processed = processed + 1
+                if processed % 500 == 0 then task.wait() end
             end
         end)
 
@@ -3576,6 +3693,7 @@ local function CollectCoins()
     bg.Parent = hrp
 
     local isFirstCoin = true
+    local coinRetries: { [Instance]: number } = {} -- локальная таблица: освобождается при выходе из CollectCoins (без утечек)
 
     while not IsTerminated and CurrentState == State.Action and SETTINGS.AutoFarmEnabled and not BagIsFull and rt:CheckIfPlayerWasInARound() do
         char = rt:Character()
@@ -3629,6 +3747,16 @@ local function CollectCoins()
 
                 if IsBagFull() then
                     break
+                end
+            elseif not pickedUp and rt.touchedCoins[targetCoin] == "pending" and targetCoin.Parent
+                and targetCoin:FindFirstChildWhichIsA("TouchTransmitter") then
+                -- Полёт оборвался по таймауту, а монета всё ещё на карте: возвращаем её в пул (одна повторная попытка),
+                -- иначе она навсегда останется "pending" и будет потеряна до конца раунда
+                local tries = (coinRetries[targetCoin] or 0) + 1
+                coinRetries[targetCoin] = tries
+                if tries <= 1 then
+                    rt.touchedCoins[targetCoin] = nil
+                    rt.cachedCoins[targetCoin] = true
                 end
             end
         else
@@ -3918,6 +4046,9 @@ local function RunFarmCycle()
                 CurrentState = State.WaitingForRound
                 task.wait(1)
             end
+        else
+            -- Фарм выключен: нет смысла крутить цикл каждый кадр
+            task.wait(0.25)
         end
         task.wait()
     end
@@ -4124,6 +4255,8 @@ local function TerminateScript()
     RejoinPending = false
     Working = false
     isVotingNoclip = false
+    safeNoclipUntil = 0
+    ResetSafeZoneState()
     UnequipKnife()
     
     for _, conn in ipairs(ActiveConnections) do
