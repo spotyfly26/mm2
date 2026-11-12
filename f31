@@ -1266,8 +1266,13 @@ SetupRemoteHooks()
 -- =====================================================================
 -- АВТОМАТИЧЕСКИЙ ПРОПУСК ЭКРАНОВ ВХОДА (DEVICE SELECT & JOIN FRIENDS)
 -- =====================================================================
+local deviceSelectDismissed = false
+local joinPromptDismissed = false
+
 local function DismissDeviceSelect(devSelectGui: Instance)
-    if IsTerminated then return end
+    if IsTerminated or deviceSelectDismissed then return end
+    deviceSelectDismissed = true
+    
     print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Выполняем автовыбор Tablet...")
     UpdateStatus("Выбор устройства: Tablet...", Color3.fromRGB(120, 200, 255))
     
@@ -1279,34 +1284,35 @@ local function DismissDeviceSelect(devSelectGui: Instance)
         end)
     end
 
-    -- 2. Клиентская активация кнопки Tablet.Button (один чистый клик)
+    -- 2. Клиентская активация кнопки Tablet.Button (надежный мульти-клик без Destroy)
     local container = devSelectGui:FindFirstChild("Container")
     local tablet = container and container:FindFirstChild("Tablet")
     local btn = tablet and tablet:FindFirstChild("Button")
     
     if btn and btn:IsA("GuiButton") then
-        local clicked = false
-        local fs = firesignal or (syn and syn.firesignal)
-        if typeof(fs) == "function" then
-            local ok = pcall(function() fs(btn.Activated) end)
-            if ok then clicked = true end
-        end
-
-        if not clicked then
-            local gc = getconnections or (syn and syn.getconnections)
-            if typeof(gc) == "function" then
-                local sOk, sig = pcall(function() return btn.Activated end)
+        local gc = getconnections or (syn and syn.getconnections)
+        if typeof(gc) == "function" then
+            for _, evName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Up"}) do
+                local sOk, sig = pcall(function() return (btn :: any)[evName] end)
                 if sOk and sig then
                     local cOk, conns = pcall(gc, sig)
-                    if cOk and typeof(conns) == "table" and #conns > 0 then
-                        pcall(function() conns[1]:Fire() end)
-                        clicked = true
+                    if cOk and typeof(conns) == "table" then
+                        for _, c in ipairs(conns) do
+                            pcall(function() c:Fire() end)
+                        end
                     end
                 end
             end
         end
+        
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            pcall(function() fs(btn.Activated) end)
+            pcall(function() fs(btn.MouseButton1Click) end)
+            pcall(function() fs(btn.MouseButton1Up) end)
+        end
 
-        if not clicked and btn:IsA("GuiObject") then
+        if btn:IsA("GuiObject") then
             pcall(function()
                 local vim = game:GetService("VirtualInputManager")
                 local absPos = btn.AbsolutePosition
@@ -1322,11 +1328,12 @@ local function DismissDeviceSelect(devSelectGui: Instance)
 end
 
 local function DismissJoinPrompt(joinGui: Instance)
-    if IsTerminated then return end
+    if IsTerminated or joinPromptDismissed then return end
     
-    -- Небольшая пауза, чтобы клиент MM2 успел инициализировать контроллеры интерфейса и камеру
-    task.wait(0.8)
-    if IsTerminated or not joinGui or not joinGui.Parent then return end
+    -- Пауза, чтобы клиент MM2 успел инициализировать контроллеры интерфейса
+    task.wait(0.5)
+    if IsTerminated or joinPromptDismissed or not joinGui or not joinGui.Parent then return end
+    joinPromptDismissed = true
 
     print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Нажимаем кнопку 'Play'...")
     UpdateStatus("Пропуск окна друзей (Play)...", Color3.fromRGB(120, 200, 255))
@@ -1335,32 +1342,32 @@ local function DismissJoinPrompt(joinGui: Instance)
     local playBtn = (friends and friends:FindFirstChild("Play")) or joinGui:FindFirstChild("Play", true)
     
     if playBtn and playBtn:IsA("GuiButton") then
-        local clicked = false
-        
-        -- Приоритет 1: firesignal на Activated (стандартный чистый эвент Roblox)
-        local fs = firesignal or (syn and syn.firesignal)
-        if typeof(fs) == "function" then
-            local ok = pcall(function() fs(playBtn.Activated) end)
-            if ok then clicked = true end
-        end
-        
-        -- Приоритет 2: вызов первого слушателя getconnections, если firesignal недоступен
-        if not clicked then
-            local gc = getconnections or (syn and syn.getconnections)
-            if typeof(gc) == "function" then
-                local sOk, sig = pcall(function() return playBtn.Activated end)
+        -- 1. Срабатывание слушателей через getconnections (MouseButton1Click, Activated, MouseButton1Up)
+        local gc = getconnections or (syn and syn.getconnections)
+        if typeof(gc) == "function" then
+            for _, evName in ipairs({"MouseButton1Click", "Activated", "MouseButton1Up"}) do
+                local sOk, sig = pcall(function() return (playBtn :: any)[evName] end)
                 if sOk and sig then
                     local cOk, conns = pcall(gc, sig)
-                    if cOk and typeof(conns) == "table" and #conns > 0 then
-                        pcall(function() conns[1]:Fire() end)
-                        clicked = true
+                    if cOk and typeof(conns) == "table" then
+                        for _, c in ipairs(conns) do
+                            pcall(function() c:Fire() end)
+                        end
                     end
                 end
             end
         end
+        
+        -- 2. Искусственные сигналы firesignal
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            pcall(function() fs(playBtn.MouseButton1Click) end)
+            pcall(function() fs(playBtn.Activated) end)
+            pcall(function() fs(playBtn.MouseButton1Up) end)
+        end
 
-        -- Приоритет 3: эмуляция клика через VirtualInputManager только как запасной вариант
-        if not clicked and playBtn:IsA("GuiObject") then
+        -- 3. Эмуляция нажатия через VirtualInputManager
+        if playBtn:IsA("GuiObject") then
             pcall(function()
                 local vim = game:GetService("VirtualInputManager")
                 local absPos = playBtn.AbsolutePosition
