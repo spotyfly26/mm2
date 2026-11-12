@@ -9,6 +9,7 @@
 -- =====================================================================
 
 -- === ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА (ANTI-DUPLICATE) ===
+do
 local SCRIPT_GUI_NAME = "MM2_AIO_Gui"
 local SCRIPT_TAG_NAME = "MM2_AIO_ACTIVE_MARKER"
 local SharedEnv: { [string]: any } = (typeof(getgenv) == "function" and getgenv()) or _G
@@ -48,6 +49,7 @@ elseif existingMarker then
     end
     pcall(function() existingMarker:Destroy() end)
 end
+end
 
 -- Установка временного маркера активности сессии
 local SessionMarker: Instance? = nil
@@ -56,7 +58,7 @@ pcall(function()
     local targetParent = (okHui and hui) or (pcall(function() return game:GetService("CoreGui") end) and game:GetService("CoreGui"))
     if targetParent then
         local marker = Instance.new("Folder")
-        marker.Name = SCRIPT_TAG_NAME
+        marker.Name = "MM2_AIO_ACTIVE_MARKER"
         marker.Parent = targetParent
         SessionMarker = marker
     end
@@ -160,87 +162,87 @@ local function SaveMapSize(mapName: string, area: number)
     end
 end
 
-local function Cross2D(o: Vector2, a: Vector2, b: Vector2): number
-    return (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X)
-end
-
--- Проекция точек Spawns на плоскость XZ -> выпуклая оболочка (без самопересечений) + площадь по формуле шнуровки
-local function CalculateMapArea(mapModel: Instance): number?
-    local spawns = mapModel:FindFirstChild("Spawns")
-    if not spawns then return nil end
-
-    local sorted: { Vector2 } = {}
-    local function addPart(part: BasePart)
-        local p = part.Position
-        if p.X == p.X and p.Z == p.Z then
-            table.insert(sorted, Vector2.new(p.X, p.Z))
-        end
-    end
-
-    if spawns:IsA("BasePart") then
-        addPart(spawns)
-    end
-    for _, desc in ipairs(spawns:GetDescendants()) do
-        if desc:IsA("BasePart") then
-            addPart(desc)
-        end
-    end
-
-    if #sorted < 3 then return nil end
-
-    table.sort(sorted, function(a: Vector2, b: Vector2): boolean
-        if a.X ~= b.X then return a.X < b.X end
-        return a.Y < b.Y
-    end)
-
-    local unique: { Vector2 } = {}
-    for _, p in ipairs(sorted) do
-        local prev = unique[#unique]
-        if not prev or math.abs(p.X - prev.X) > 1e-3 or math.abs(p.Y - prev.Y) > 1e-3 then
-            table.insert(unique, p)
-        end
-    end
-
-    if #unique < 3 then return nil end
-
-    local lower: { Vector2 } = {}
-    for _, p in ipairs(unique) do
-        while #lower >= 2 and Cross2D(lower[#lower - 1], lower[#lower], p) <= 0 do
-            table.remove(lower)
-        end
-        table.insert(lower, p)
-    end
-
-    local upper: { Vector2 } = {}
-    for i = #unique, 1, -1 do
-        local p = unique[i]
-        while #upper >= 2 and Cross2D(upper[#upper - 1], upper[#upper], p) <= 0 do
-            table.remove(upper)
-        end
-        table.insert(upper, p)
-    end
-
-    table.remove(lower)
-    table.remove(upper)
-    for _, p in ipairs(upper) do
-        table.insert(lower, p)
-    end
-
-    local hullCount = #lower
-    if hullCount < 3 then return nil end
-
-    local sum = 0
-    for i = 1, hullCount do
-        local a = lower[i]
-        local b = lower[(i % hullCount) + 1]
-        sum = sum + (a.X * b.Y - b.X * a.Y)
-    end
-
-    local area = math.floor(math.abs(sum) * 0.5 + 0.5)
-    return (area > 0) and area or nil
-end
-
 local function RecordMapSizeIfNew(mapInstance: Instance)
+    local function Cross2D(o: Vector2, a: Vector2, b: Vector2): number
+        return (a.X - o.X) * (b.Y - o.Y) - (a.Y - o.Y) * (b.X - o.X)
+    end
+    
+    -- Проекция точек Spawns на плоскость XZ -> выпуклая оболочка (без самопересечений) + площадь по формуле шнуровки
+    local function CalculateMapArea(mapModel: Instance): number?
+        local spawns = mapModel:FindFirstChild("Spawns")
+        if not spawns then return nil end
+    
+        local sorted: { Vector2 } = {}
+        local function addPart(part: BasePart)
+            local p = part.Position
+            if p.X == p.X and p.Z == p.Z then
+                table.insert(sorted, Vector2.new(p.X, p.Z))
+            end
+        end
+    
+        if spawns:IsA("BasePart") then
+            addPart(spawns)
+        end
+        for _, desc in ipairs(spawns:GetDescendants()) do
+            if desc:IsA("BasePart") then
+                addPart(desc)
+            end
+        end
+    
+        if #sorted < 3 then return nil end
+    
+        table.sort(sorted, function(a: Vector2, b: Vector2): boolean
+            if a.X ~= b.X then return a.X < b.X end
+            return a.Y < b.Y
+        end)
+    
+        local unique: { Vector2 } = {}
+        for _, p in ipairs(sorted) do
+            local prev = unique[#unique]
+            if not prev or math.abs(p.X - prev.X) > 1e-3 or math.abs(p.Y - prev.Y) > 1e-3 then
+                table.insert(unique, p)
+            end
+        end
+    
+        if #unique < 3 then return nil end
+    
+        local lower: { Vector2 } = {}
+        for _, p in ipairs(unique) do
+            while #lower >= 2 and Cross2D(lower[#lower - 1], lower[#lower], p) <= 0 do
+                table.remove(lower)
+            end
+            table.insert(lower, p)
+        end
+    
+        local upper: { Vector2 } = {}
+        for i = #unique, 1, -1 do
+            local p = unique[i]
+            while #upper >= 2 and Cross2D(upper[#upper - 1], upper[#upper], p) <= 0 do
+                table.remove(upper)
+            end
+            table.insert(upper, p)
+        end
+    
+        table.remove(lower)
+        table.remove(upper)
+        for _, p in ipairs(upper) do
+            table.insert(lower, p)
+        end
+    
+        local hullCount = #lower
+        if hullCount < 3 then return nil end
+    
+        local sum = 0
+        for i = 1, hullCount do
+            local a = lower[i]
+            local b = lower[(i % hullCount) + 1]
+            sum = sum + (a.X * b.Y - b.X * a.Y)
+        end
+    
+        local area = math.floor(math.abs(sum) * 0.5 + 0.5)
+        return (area > 0) and area or nil
+    end
+
     if IsTerminated or not mapInstance or not mapInstance.Parent then return end
     local rawName = mapInstance.Name
     if rawName == "" or rawName == "Workspace" or rawName == "Lobby" then return end
@@ -2528,7 +2530,20 @@ local function GetSafeGuiParent()
     return LocalPlayer:WaitForChild("PlayerGui")
 end
 
-local ScreenGui = Instance.new("ScreenGui")
+
+-- Pre-declared UI references needed globally
+local ScreenGui
+local TPBtn, CloseBtn
+local startPos, dragEndConn: RBXScriptConnection?
+local RejoinPanel, RejoinCountdownLabel, BtnRejoinToggle, BtnServerMode
+local RejoinTimeInput, BtnManualRejoin, SaveRejoinBtn
+local BtnFarm, BtnVote, StatsPanel, PotatoBtn
+local setTargetFps: (fps: number) -> boolean
+local UpdateGuiSizes: () -> ()
+
+do
+
+ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "MM2_AIO_Gui"
 ScreenGui.Parent = GetSafeGuiParent()
 ScreenGui.ResetOnSpawn = false
@@ -2645,7 +2660,7 @@ if Workspace.CurrentCamera then
     end))
 end
 
-local TPBtn = Instance.new("TextButton", TitleBar)
+TPBtn = Instance.new("TextButton", TitleBar)
 TPBtn.Name = "TPBtn"
 TPBtn.Size = UDim2.new(0, 26, 0, 26)
 TPBtn.Position = UDim2.new(1, -60, 0.5, -13)
@@ -2658,7 +2673,7 @@ TPBtn.Active = true
 TPBtn.ZIndex = 15
 Instance.new("UICorner", TPBtn).CornerRadius = UDim.new(0, 6)
 
-local CloseBtn = Instance.new("TextButton", TitleBar)
+CloseBtn = Instance.new("TextButton", TitleBar)
 CloseBtn.Name = "CloseBtn"
 CloseBtn.Size = UDim2.new(0, 26, 0, 26)
 CloseBtn.Position = UDim2.new(1, -30, 0.5, -13)
@@ -2679,8 +2694,8 @@ CloseBtn.MouseLeave:Connect(function()
 end)
 
 -- Перетаскивание окна
-local dragging, dragInput, dragStart, startPos
-local dragEndConn: RBXScriptConnection? = nil
+    local dragging, dragInput, dragStart; startPos = nil
+    dragEndConn = nil
 
 RegisterConnection(TitleBar.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -2717,7 +2732,8 @@ RegisterConnection(RunService.RenderStepped:Connect(function()
 end))
 
 -- === ДОЧЕРНЯЯ ПАНЕЛЬ АВТОРЕКОННЕКТА ===
-local RejoinPanel = Instance.new("Frame", MainFrame)
+do -- RejoinPanel sub-block
+RejoinPanel = Instance.new("Frame", MainFrame)
 RejoinPanel.Name = "RejoinPanel"
 RejoinPanel.Size = UDim2.new(0, 210, 1, 0)
 RejoinPanel.Position = UDim2.new(1, 8, 0, 0)
@@ -2768,7 +2784,7 @@ RejoinStatusHeader.Font = Enum.Font.GothamBold
 RejoinStatusHeader.TextSize = 10
 RejoinStatusHeader.TextXAlignment = Enum.TextXAlignment.Center
 
-local RejoinCountdownLabel = Instance.new("TextLabel", RejoinCountdownCard)
+RejoinCountdownLabel = Instance.new("TextLabel", RejoinCountdownCard)
 RejoinCountdownLabel.Name = "RejoinCountdownLabel"
 RejoinCountdownLabel.Size = UDim2.new(1, -10, 0, 22)
 RejoinCountdownLabel.Position = UDim2.new(0, 5, 0, 20)
@@ -2781,7 +2797,7 @@ RejoinCountdownLabel.TextXAlignment = Enum.TextXAlignment.Center
 RejoinCountdownLabel.TextWrapped = true
 
 -- Кнопка переключения автореконнекта (ON / OFF)
-local BtnRejoinToggle = Instance.new("TextButton", RejoinPanel)
+BtnRejoinToggle = Instance.new("TextButton", RejoinPanel)
 BtnRejoinToggle.Name = "BtnRejoinToggle"
 BtnRejoinToggle.Size = UDim2.new(1, -16, 0, 30)
 BtnRejoinToggle.Position = UDim2.new(0, 8, 0, 98)
@@ -2795,7 +2811,7 @@ BtnRejoinToggle.ZIndex = 10
 Instance.new("UICorner", BtnRejoinToggle).CornerRadius = UDim.new(0, 6)
 
 -- Кнопка выбора типа сервера (Текущий / Случайный)
-local BtnServerMode = Instance.new("TextButton", RejoinPanel)
+BtnServerMode = Instance.new("TextButton", RejoinPanel)
 BtnServerMode.Name = "BtnServerMode"
 BtnServerMode.Size = UDim2.new(1, -16, 0, 30)
 BtnServerMode.Position = UDim2.new(0, 8, 0, 134)
@@ -2827,7 +2843,7 @@ RejoinInputLabel.Font = Enum.Font.GothamBold
 RejoinInputLabel.TextSize = 10
 RejoinInputLabel.TextXAlignment = Enum.TextXAlignment.Left
 
-local RejoinTimeInput = Instance.new("TextBox", RejoinInputCard)
+RejoinTimeInput = Instance.new("TextBox", RejoinInputCard)
 RejoinTimeInput.Name = "RejoinTimeInput"
 RejoinTimeInput.Size = UDim2.new(1, -10, 0, 26)
 RejoinTimeInput.Position = UDim2.new(0, 5, 0, 24)
@@ -2841,7 +2857,7 @@ RejoinTimeInput.ClearTextOnFocus = false
 Instance.new("UICorner", RejoinTimeInput).CornerRadius = UDim.new(0, 4)
 
 -- Кнопка ручного перезахода прямо сейчас
-local BtnManualRejoin = Instance.new("TextButton", RejoinPanel)
+BtnManualRejoin = Instance.new("TextButton", RejoinPanel)
 BtnManualRejoin.Name = "BtnManualRejoin"
 BtnManualRejoin.Size = UDim2.new(1, -16, 0, 28)
 BtnManualRejoin.Position = UDim2.new(0, 8, 0, 232)
@@ -2855,7 +2871,7 @@ BtnManualRejoin.ZIndex = 10
 Instance.new("UICorner", BtnManualRejoin).CornerRadius = UDim.new(0, 6)
 
 -- Кнопка сохранения настроек реконнекта в профиль
-local SaveRejoinBtn = Instance.new("TextButton", RejoinPanel)
+SaveRejoinBtn = Instance.new("TextButton", RejoinPanel)
 SaveRejoinBtn.Name = "SaveRejoinBtn"
 SaveRejoinBtn.Size = UDim2.new(1, -16, 0, 28)
 SaveRejoinBtn.Position = UDim2.new(0, 8, 0, 266)
@@ -2869,6 +2885,8 @@ SaveRejoinBtn.ZIndex = 10
 Instance.new("UICorner", SaveRejoinBtn).CornerRadius = UDim.new(0, 6)
 
 -- Кнопка сохранения профиля по умолчанию (над кнопками СТАТИСТИКА, ФАРМ, ГОЛОС)
+end -- RejoinPanel sub-block end
+
 local SaveProfileBtn = Instance.new("TextButton", MainFrame)
 SaveProfileBtn.Name = "SaveProfileBtn"
 SaveProfileBtn.Size = UDim2.new(1, -16, 0, 26)
@@ -2917,8 +2935,8 @@ end
 local isInitialStats = (initialProfile and initialProfile.StatsPanelVisible == true) or false
 
 local BtnStats = CreateTopButton("СТАТИСТИКА", isInitialStats and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(60, 60, 70), TopMenu)
-local BtnFarm = CreateTopButton(SETTINGS.AutoFarmEnabled and "ФАРМ: ON" or "ФАРМ: OFF", SETTINGS.AutoFarmEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50), TopMenu)
-local BtnVote = CreateTopButton(SETTINGS.AutoVoteEnabled and "ГОЛОС: ON" or "ГОЛОС: OFF", SETTINGS.AutoVoteEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50), TopMenu)
+BtnFarm = CreateTopButton(SETTINGS.AutoFarmEnabled and "ФАРМ: ON" or "ФАРМ: OFF", SETTINGS.AutoFarmEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50), TopMenu)
+BtnVote = CreateTopButton(SETTINGS.AutoVoteEnabled and "ГОЛОС: ON" or "ГОЛОС: OFF", SETTINGS.AutoVoteEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50), TopMenu)
 
 -- Форматирование текста статистики
 local function getStatsDisplayText(): string
@@ -2938,7 +2956,7 @@ local function getStatsDisplayText(): string
 end
 
 -- Панель статистики
-local StatsPanel = Instance.new("Frame", MainFrame)
+StatsPanel = Instance.new("Frame", MainFrame)
 StatsPanel.Size = UDim2.new(1, -16, 0, 80)
 StatsPanel.Position = UDim2.new(0, 8, 0, 107)
 StatsPanel.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
@@ -2973,7 +2991,7 @@ SettingsLayout.SortOrder = Enum.SortOrder.LayoutOrder
 SettingsLayout.Padding = UDim.new(0, 5)
 
 -- Универсальное ограничение FPS
-local function setTargetFps(fps: number): boolean
+setTargetFps = function(fps: number): boolean
     local fn = setfpscap or (getgenv and getgenv().setfpscap) or set_fps_cap or (getgenv and getgenv().set_fps_cap)
     if typeof(fn) == "function" then
         local ok = pcall(fn, fps)
@@ -3043,7 +3061,7 @@ CreateControlRow(SettingsContainer, "FPS CAP", SETTINGS.FpsCap, 6, 60, 2, functi
     if SETTINGS.PotatoMode then setTargetFps(val) end
 end)
 
-local PotatoBtn = Instance.new("TextButton", SettingsContainer)
+PotatoBtn = Instance.new("TextButton", SettingsContainer)
 PotatoBtn.Size = UDim2.new(1, 0, 0, 35)
 PotatoBtn.BackgroundColor3 = SETTINGS.PotatoMode and Color3.fromRGB(200, 150, 50) or Color3.fromRGB(60, 60, 70)
 PotatoBtn.Text = "POTATO MODE: " .. (SETTINGS.PotatoMode and "ON" or "OFF")
@@ -3194,7 +3212,7 @@ UpdateStatus = function(text, color)
 end
 
 -- Динамическое обновление размеров GUI
-local function UpdateGuiSizes()
+UpdateGuiSizes = function()
     local isStats = StatsPanel.Visible
     local isTwin = (SETTINGS.GameMode == "Twin")
     local isVote = (SETTINGS.AutoVoteEnabled == true)
@@ -3340,6 +3358,8 @@ BindClick(BtnStats, function()
     BtnStats.BackgroundColor3 = StatsPanel.Visible and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(60, 60, 70)
     UpdateGuiSizes()
 end)
+
+end -- UI block end
 
 local function resetStats()
     StatsData.StartTime = 0
@@ -3639,13 +3659,6 @@ task.spawn(function()
 end)
 
 -- === POTATO MODE ===
-local EffectsToDestroy = {
-    ["Decal"] = true, ["Texture"] = true, ["PostEffect"] = true,
-    ["Sky"] = true, ["Atmosphere"] = true, ["SunRaysEffect"] = true,
-    ["BloomEffect"] = true, ["BlurEffect"] = true, ["ColorCorrectionEffect"] = true,
-    ["DepthOfFieldEffect"] = true, ["ParticleEmitter"] = true, ["Trail"] = true,
-    ["Fire"] = true, ["Smoke"] = true, ["Sparkles"] = true
-}
 
 local RenderingDisabled = false
 local SavedLighting: { GlobalShadows: boolean, FogEnd: number, Brightness: number }? = nil
@@ -3660,26 +3673,36 @@ local function RestoreLighting()
     end
 end
 
-local function makePartPotato(v)
-    if v:IsA("BasePart") then
-        if not RenderingDisabled then
-            v.Material = Enum.Material.SmoothPlastic
-            v.Reflectance = 0
-            v.CastShadow = false
-            if v:IsA("MeshPart") then
-                v.TextureID = ""
-            end
-        end
-    elseif EffectsToDestroy[v.ClassName] then
-        v:Destroy()
-    end
-end
 
-local function IsCharacterInstance(inst: Instance): boolean
-    return (inst:IsA("Model") and (Players:GetPlayerFromCharacter(inst) ~= nil or inst:FindFirstChildOfClass("Humanoid") ~= nil))
-end
 
 local function applyPotatoMode()
+    local EffectsToDestroy = {
+        ["Decal"] = true, ["Texture"] = true, ["PostEffect"] = true,
+        ["Sky"] = true, ["Atmosphere"] = true, ["SunRaysEffect"] = true,
+        ["BloomEffect"] = true, ["BlurEffect"] = true, ["ColorCorrectionEffect"] = true,
+        ["DepthOfFieldEffect"] = true, ["ParticleEmitter"] = true, ["Trail"] = true,
+        ["Fire"] = true, ["Smoke"] = true, ["Sparkles"] = true
+    }
+    
+    local function IsCharacterInstance(inst: Instance): boolean
+        return (inst:IsA("Model") and (Players:GetPlayerFromCharacter(inst) ~= nil or inst:FindFirstChildOfClass("Humanoid") ~= nil))
+    end
+    
+    local function makePartPotato(v)
+        if v:IsA("BasePart") then
+            if not RenderingDisabled then
+                v.Material = Enum.Material.SmoothPlastic
+                v.Reflectance = 0
+                v.CastShadow = false
+                if v:IsA("MeshPart") then
+                    v.TextureID = ""
+                end
+            end
+        elseif EffectsToDestroy[v.ClassName] then
+            v:Destroy()
+        end
+    end
+    
     if SETTINGS.PotatoMode then
         local supported = setTargetFps(SETTINGS.FpsCap)
         if not supported then
