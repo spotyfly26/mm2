@@ -1279,50 +1279,53 @@ local function DismissDeviceSelect(devSelectGui: Instance)
         end)
     end
 
-    -- 2. Клиентская активация кнопки Tablet.Button
+    -- 2. Клиентская активация кнопки Tablet.Button (один чистый клик)
     local container = devSelectGui:FindFirstChild("Container")
     local tablet = container and container:FindFirstChild("Tablet")
     local btn = tablet and tablet:FindFirstChild("Button")
     
     if btn and btn:IsA("GuiButton") then
-        local gc = getconnections or (syn and syn.getconnections)
-        if typeof(gc) == "function" then
-            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
-                local sOk, sig = pcall(function() return (btn :: any)[evName] end)
+        local clicked = false
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            local ok = pcall(function() fs(btn.Activated) end)
+            if ok then clicked = true end
+        end
+
+        if not clicked then
+            local gc = getconnections or (syn and syn.getconnections)
+            if typeof(gc) == "function" then
+                local sOk, sig = pcall(function() return btn.Activated end)
                 if sOk and sig then
                     local cOk, conns = pcall(gc, sig)
-                    if cOk and typeof(conns) == "table" then
-                        for _, c in ipairs(conns) do
-                            pcall(function() c:Fire() end)
-                        end
+                    if cOk and typeof(conns) == "table" and #conns > 0 then
+                        pcall(function() conns[1]:Fire() end)
+                        clicked = true
                     end
                 end
             end
         end
-        
-        local fs = firesignal or (syn and syn.firesignal)
-        if typeof(fs) == "function" then
-            pcall(function() fs(btn.Activated) end)
-            pcall(function() fs(btn.MouseButton1Click) end)
+
+        if not clicked and btn:IsA("GuiObject") then
+            pcall(function()
+                local vim = game:GetService("VirtualInputManager")
+                local absPos = btn.AbsolutePosition
+                local absSize = btn.AbsoluteSize
+                local cx = absPos.X + absSize.X / 2
+                local cy = absPos.Y + absSize.Y / 2
+                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
+                task.wait(0.05)
+                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
+            end)
         end
     end
-
-    -- 3. Гарантированное скрытие интерфейса на клиенте
-    task.delay(0.3, function()
-        if devSelectGui and devSelectGui.Parent then
-            if devSelectGui:IsA("ScreenGui") then
-                devSelectGui.Enabled = false
-            end
-            pcall(function() devSelectGui:Destroy() end)
-        end
-    end)
 end
 
 local function DismissJoinPrompt(joinGui: Instance)
     if IsTerminated then return end
     
     -- Небольшая пауза, чтобы клиент MM2 успел инициализировать контроллеры интерфейса и камеру
-    task.wait(1.2)
+    task.wait(0.8)
     if IsTerminated or not joinGui or not joinGui.Parent then return end
 
     print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Нажимаем кнопку 'Play'...")
@@ -1332,29 +1335,32 @@ local function DismissJoinPrompt(joinGui: Instance)
     local playBtn = (friends and friends:FindFirstChild("Play")) or joinGui:FindFirstChild("Play", true)
     
     if playBtn and playBtn:IsA("GuiButton") then
-        local gc = getconnections or (syn and syn.getconnections)
-        if typeof(gc) == "function" then
-            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
-                local sOk, sig = pcall(function() return (playBtn :: any)[evName] end)
+        local clicked = false
+        
+        -- Приоритет 1: firesignal на Activated (стандартный чистый эвент Roblox)
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            local ok = pcall(function() fs(playBtn.Activated) end)
+            if ok then clicked = true end
+        end
+        
+        -- Приоритет 2: вызов первого слушателя getconnections, если firesignal недоступен
+        if not clicked then
+            local gc = getconnections or (syn and syn.getconnections)
+            if typeof(gc) == "function" then
+                local sOk, sig = pcall(function() return playBtn.Activated end)
                 if sOk and sig then
                     local cOk, conns = pcall(gc, sig)
-                    if cOk and typeof(conns) == "table" then
-                        for _, c in ipairs(conns) do
-                            pcall(function() c:Fire() end)
-                        end
+                    if cOk and typeof(conns) == "table" and #conns > 0 then
+                        pcall(function() conns[1]:Fire() end)
+                        clicked = true
                     end
                 end
             end
         end
-        
-        local fs = firesignal or (syn and syn.firesignal)
-        if typeof(fs) == "function" then
-            pcall(function() fs(playBtn.Activated) end)
-            pcall(function() fs(playBtn.MouseButton1Click) end)
-        end
 
-        -- Эмуляция нажатия через VirtualInputManager
-        if playBtn:IsA("GuiObject") then
+        -- Приоритет 3: эмуляция клика через VirtualInputManager только как запасной вариант
+        if not clicked and playBtn:IsA("GuiObject") then
             pcall(function()
                 local vim = game:GetService("VirtualInputManager")
                 local absPos = playBtn.AbsolutePosition
@@ -1367,14 +1373,6 @@ local function DismissJoinPrompt(joinGui: Instance)
             end)
         end
     end
-
-    -- Мягкое отключение видимости без Destroy, чтобы внутренние корутины MM2
-    -- (анимация плавного затемнения/открытия камеры и основного GUI) завершились штатно.
-    task.delay(1.5, function()
-        if not IsTerminated and joinGui and joinGui.Parent and joinGui:IsA("ScreenGui") then
-            joinGui.Enabled = false
-        end
-    end)
 end
 
 local function SetupInitialScreensBypass()
@@ -1408,7 +1406,7 @@ local function SetupInitialScreensBypass()
                 end
             elseif child.Name == "Join" then
                 task.spawn(function()
-                    --DismissJoinPrompt(child)
+                    DismissJoinPrompt(child)
                 end)
             end
         end))
