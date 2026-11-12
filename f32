@@ -1266,13 +1266,8 @@ SetupRemoteHooks()
 -- =====================================================================
 -- АВТОМАТИЧЕСКИЙ ПРОПУСК ЭКРАНОВ ВХОДА (DEVICE SELECT & JOIN FRIENDS)
 -- =====================================================================
-local deviceSelectDismissed = false
-local joinPromptDismissed = false
-
 local function DismissDeviceSelect(devSelectGui: Instance)
-    if IsTerminated or deviceSelectDismissed then return end
-    deviceSelectDismissed = true
-    
+    if IsTerminated then return end
     print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Выполняем автовыбор Tablet...")
     UpdateStatus("Выбор устройства: Tablet...", Color3.fromRGB(120, 200, 255))
     
@@ -1284,7 +1279,7 @@ local function DismissDeviceSelect(devSelectGui: Instance)
         end)
     end
 
-    -- 2. Клиентская активация кнопки Tablet.Button (надежный мульти-клик без Destroy)
+    -- 2. Клиентская активация кнопки Tablet.Button
     local container = devSelectGui:FindFirstChild("Container")
     local tablet = container and container:FindFirstChild("Tablet")
     local btn = tablet and tablet:FindFirstChild("Button")
@@ -1292,7 +1287,7 @@ local function DismissDeviceSelect(devSelectGui: Instance)
     if btn and btn:IsA("GuiButton") then
         local gc = getconnections or (syn and syn.getconnections)
         if typeof(gc) == "function" then
-            for _, evName in ipairs({"Activated", "MouseButton1Click", "MouseButton1Up"}) do
+            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
                 local sOk, sig = pcall(function() return (btn :: any)[evName] end)
                 if sOk and sig then
                     local cOk, conns = pcall(gc, sig)
@@ -1309,32 +1304,19 @@ local function DismissDeviceSelect(devSelectGui: Instance)
         if typeof(fs) == "function" then
             pcall(function() fs(btn.Activated) end)
             pcall(function() fs(btn.MouseButton1Click) end)
-            pcall(function() fs(btn.MouseButton1Up) end)
-        end
-
-        if btn:IsA("GuiObject") then
-            pcall(function()
-                local vim = game:GetService("VirtualInputManager")
-                local absPos = btn.AbsolutePosition
-                local absSize = btn.AbsoluteSize
-                local cx = absPos.X + absSize.X / 2
-                local cy = absPos.Y + absSize.Y / 2
-                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
-                task.wait(0.05)
-                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
-            end)
         end
     end
+
+    -- 3. Мягкое скрытие интерфейса на клиенте без Destroy
+    task.delay(0.3, function()
+        if devSelectGui and devSelectGui.Parent and devSelectGui:IsA("ScreenGui") then
+            devSelectGui.Enabled = false
+        end
+    end)
 end
 
 local function DismissJoinPrompt(joinGui: Instance)
-    if IsTerminated or joinPromptDismissed then return end
-    
-    -- Пауза, чтобы клиент MM2 успел инициализировать контроллеры интерфейса
-    task.wait(0.5)
-    if IsTerminated or joinPromptDismissed or not joinGui or not joinGui.Parent then return end
-    joinPromptDismissed = true
-
+    if IsTerminated then return end
     print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Нажимаем кнопку 'Play'...")
     UpdateStatus("Пропуск окна друзей (Play)...", Color3.fromRGB(120, 200, 255))
     
@@ -1342,10 +1324,9 @@ local function DismissJoinPrompt(joinGui: Instance)
     local playBtn = (friends and friends:FindFirstChild("Play")) or joinGui:FindFirstChild("Play", true)
     
     if playBtn and playBtn:IsA("GuiButton") then
-        -- 1. Срабатывание слушателей через getconnections (MouseButton1Click, Activated, MouseButton1Up)
         local gc = getconnections or (syn and syn.getconnections)
         if typeof(gc) == "function" then
-            for _, evName in ipairs({"MouseButton1Click", "Activated", "MouseButton1Up"}) do
+            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
                 local sOk, sig = pcall(function() return (playBtn :: any)[evName] end)
                 if sOk and sig then
                     local cOk, conns = pcall(gc, sig)
@@ -1358,15 +1339,13 @@ local function DismissJoinPrompt(joinGui: Instance)
             end
         end
         
-        -- 2. Искусственные сигналы firesignal
         local fs = firesignal or (syn and syn.firesignal)
         if typeof(fs) == "function" then
-            pcall(function() fs(playBtn.MouseButton1Click) end)
             pcall(function() fs(playBtn.Activated) end)
-            pcall(function() fs(playBtn.MouseButton1Up) end)
+            pcall(function() fs(playBtn.MouseButton1Click) end)
         end
 
-        -- 3. Эмуляция нажатия через VirtualInputManager
+        -- Эмуляция нажатия через VirtualInputManager
         if playBtn:IsA("GuiObject") then
             pcall(function()
                 local vim = game:GetService("VirtualInputManager")
@@ -1384,37 +1363,28 @@ end
 
 local function SetupInitialScreensBypass()
     task.spawn(function()
-        -- Ожидаем полную загрузку базовых ресурсов игры перед обработкой стартовых экранов
-        if not game:IsLoaded() then
-            game.Loaded:Wait()
-        end
-
-        local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
-        if not playerGui or IsTerminated then return end
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+        if not playerGui then return end
 
         -- Если экраны уже активны на момент старта
         local existingDev = playerGui:FindFirstChild("DeviceSelect")
         if existingDev then
-            task.spawn(DismissDeviceSelect, existingDev)
+            DismissDeviceSelect(existingDev)
         end
 
         local existingJoin = playerGui:FindFirstChild("Join")
         if existingJoin then
-            task.spawn(DismissJoinPrompt, existingJoin)
+            DismissJoinPrompt(existingJoin)
         end
 
         -- Неблокирующее отслеживание появления экранов
         RegisterConnection(playerGui.ChildAdded:Connect(function(child)
-            if IsTerminated then return end
             if child.Name == "DeviceSelect" then
-                task.wait(0.2)
-                if not IsTerminated and child.Parent then
-                    DismissDeviceSelect(child)
-                end
+                task.wait(0.1)
+                DismissDeviceSelect(child)
             elseif child.Name == "Join" then
-                task.spawn(function()
-                    DismissJoinPrompt(child)
-                end)
+                task.wait(0.1)
+                DismissJoinPrompt(child)
             end
         end))
     end)
