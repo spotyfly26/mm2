@@ -1318,7 +1318,7 @@ local function DismissDeviceSelect(devSelectGui: Instance)
     end)
 end
 
---local function DismissJoinPrompt(joinGui: Instance)
+local function DismissJoinPrompt(joinGui: Instance)
     if IsTerminated then return end
     
     -- Небольшая пауза, чтобы клиент MM2 успел инициализировать контроллеры интерфейса и камеру
@@ -1408,7 +1408,7 @@ local function SetupInitialScreensBypass()
                 end
             elseif child.Name == "Join" then
                 task.spawn(function()
-                    DismissJoinPrompt(child)
+                    --DismissJoinPrompt(child)
                 end)
             end
         end))
