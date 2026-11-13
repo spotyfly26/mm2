@@ -284,8 +284,8 @@ end
 local function SanitizeTwinName(val: any): string
     if typeof(val) ~= "string" then return "" end
     local trimmed = string.gsub(val, "^%s*(.-)%s*$", "%1")
-    if #trimmed > 25 then
-        trimmed = string.sub(trimmed, 1, 25)
+    if #trimmed > 300 then
+        trimmed = string.sub(trimmed, 1, 300)
     end
     return trimmed
 end
@@ -433,6 +433,18 @@ local State = {
 
 local CurrentState = State.WaitingForRound
 local BagIsFull = false
+
+-- === ГЛОБАЛЬНЫЕ ССЫЛКИ GUI И ФЛАГ БАЙПАСА СТАРТОВЫХ ЭКРАНОВ ===
+local ScreenGui: ScreenGui? = nil
+local MainFrame: Frame? = nil
+local InitialBypassActive = false
+
+local function CheckAnyStartupScreens(): boolean
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then return false end
+    return (pGui:FindFirstChild("Join") ~= nil) or (pGui:FindFirstChild("JoinPhone") ~= nil) or (pGui:FindFirstChild("DeviceSelect") ~= nil)
+end
+InitialBypassActive = CheckAnyStartupScreens()
 
 -- === ПЕРЕМЕННЫЕ АВТОРЕКОННЕКТА ===
 local isTeleporting = false
@@ -1375,6 +1387,13 @@ local function ClickGuiTarget(target: Instance): boolean
 
     -- 3. Аппаратный клик через координаты
     if target.AbsoluteSize.X > 0 and target.AbsoluteSize.Y > 0 then
+        -- Временно скрываем ScreenGui на время аппаратного клика,
+        -- чтобы клик не перехватывался MainFrame скрипта
+        local wasGuiEnabled = (ScreenGui and ScreenGui.Enabled) == true
+        if wasGuiEnabled then
+            ScreenGui.Enabled = false
+        end
+
         local absPos = target.AbsolutePosition
         local absSize = target.AbsoluteSize
         local cx = absPos.X + absSize.X / 2
@@ -1407,6 +1426,11 @@ local function ClickGuiTarget(target: Instance): boolean
             end)
             clicked = true
         end
+
+        -- Восстанавливаем только если начальный байпас экранов уже закончен
+        if wasGuiEnabled and ScreenGui and not InitialBypassActive then
+            ScreenGui.Enabled = true
+        end
     end
 
     return clicked
@@ -1416,7 +1440,9 @@ local function DismissDeviceSelect(devSelectGui: Instance)
     if IsTerminated then return end
     print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Запуск цикла автовыбора Phone...")
     UpdateStatus("Выбор устройства: Phone...", Color3.fromRGB(120, 200, 255))
-    
+    InitialBypassActive = true
+    if ScreenGui then ScreenGui.Enabled = false end
+
     -- 1. Сетевой вызов (моментально регистрирует выбор на сервере MM2)
     local changeDevRemote = FindRemoteEvent("ChangeLastDevice")
     if changeDevRemote then
@@ -1442,6 +1468,11 @@ local function DismissDeviceSelect(devSelectGui: Instance)
             end
             task.wait(0.2)
         end
+
+        if not CheckAnyStartupScreens() then
+            InitialBypassActive = false
+            if ScreenGui then ScreenGui.Enabled = true end
+        end
     end)
 end
 
@@ -1449,6 +1480,8 @@ local function DismissJoinPrompt(joinGui: Instance)
     if IsTerminated then return end
     print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Ожидание готовности кнопки Play...")
     UpdateStatus("Окно друзей: нажатие Play...", Color3.fromRGB(120, 200, 255))
+    InitialBypassActive = true
+    if ScreenGui then ScreenGui.Enabled = false end
 
     -- Пульсирующий клик по Play: в MM2 кнопка Play подключается только ПОСЛЕ
     -- того, как завершится построение списка друзей UpdateList() (строка 449 исходника MM2).
@@ -1456,8 +1489,7 @@ local function DismissJoinPrompt(joinGui: Instance)
         local startTime = os.clock()
         while not IsTerminated and joinGui and joinGui.Parent and (os.clock() - startTime < 30) do
             local friends = joinGui:FindFirstChild("Friends")
-            local playBtn = (friends and friends:FindFirstChild("Play"))
-                or joinGui:FindFirstChild("Play", true)
+            local playBtn = friends and friends:FindFirstChild("Play")
 
             if playBtn then
                 local btnTarget = playBtn
@@ -1473,6 +1505,11 @@ local function DismissJoinPrompt(joinGui: Instance)
         if not joinGui or not joinGui.Parent then
             print("[MM2 AIO] Окно друзей (Join/Friends) успешно закрыто через Play! Родной цикл MM2 запущен.")
             UpdateStatus("Окно друзей закрыто (Play)", Color3.fromRGB(100, 255, 100))
+        end
+
+        if not CheckAnyStartupScreens() then
+            InitialBypassActive = false
+            if ScreenGui then ScreenGui.Enabled = true end
         end
     end)
 end
@@ -1521,12 +1558,67 @@ local function SetupInitialScreensBypass()
                 checkScreens()
                 task.wait(0.5)
             end
+            if not CheckAnyStartupScreens() then
+                InitialBypassActive = false
+                if ScreenGui then ScreenGui.Enabled = true end
+            end
         end)
     end)
 end
 SetupInitialScreensBypass()
 
-local cachedCleanTwin = string.lower(string.gsub(SETTINGS.TwinName or "", "^%s*(.-)%s*$", "%1"))
+-- =====================================================================
+-- СИСТЕМА СОЮЗНИКОВ / ТВИНКОВ (ПОДДЕРЖКА НЕСКОЛЬКИХ НИКОВ ЧЕРЕЗ ЗАПЯТУЮ)
+-- =====================================================================
+local function CleanNickname(raw: string?): string
+    if not raw then return "" end
+    local cleaned = raw
+    cleaned = string.gsub(cleaned, "%[", "")
+    cleaned = string.gsub(cleaned, "%]", "")
+    cleaned = string.gsub(cleaned, "[\"\'%(%)]", "")
+    cleaned = string.gsub(cleaned, "^%s*[Tt]arget[:%s]*", "")
+    cleaned = string.gsub(cleaned, "^%s*[Ee]liminate[:%s]*", "")
+    cleaned = string.gsub(cleaned, "^%s*@?", "")
+    cleaned = string.gsub(cleaned, "^%s*(.-)%s*$", "%1")
+    return cleaned
+end
+
+local cachedTwinSet: { [string]: boolean } = {}
+
+local function UpdateTwinCache(raw: string?)
+    table.clear(cachedTwinSet)
+    if not raw or raw == "" then return end
+    local myName = string.lower(LocalPlayer.Name)
+    local myDisp = string.lower(LocalPlayer.DisplayName)
+    for part in string.gmatch(raw, "[^,;]+") do
+        local trimmed = string.gsub(part, "^%s*(.-)%s*$", "%1")
+        local clean = string.lower(trimmed)
+        if clean ~= "" and clean ~= myName and clean ~= myDisp then
+            cachedTwinSet[clean] = true
+        end
+    end
+end
+
+local function IsTwinPlayer(targetPlayer: Player?, rawName: string?): boolean
+    if next(cachedTwinSet) == nil then return false end
+
+    if targetPlayer then
+        if targetPlayer == LocalPlayer then return false end
+        if cachedTwinSet[string.lower(targetPlayer.Name)] then return true end
+        if cachedTwinSet[string.lower(targetPlayer.DisplayName)] then return true end
+    end
+
+    if rawName and rawName ~= "" then
+        local clean = CleanNickname(rawName)
+        if clean ~= "" and clean ~= LocalPlayer.Name and clean ~= LocalPlayer.DisplayName then
+            if cachedTwinSet[string.lower(clean)] then return true end
+        end
+    end
+
+    return false
+end
+
+UpdateTwinCache(SETTINGS.TwinName)
 
 local function GetNearestCoin(isFirstCoin: boolean?): Instance?
     local char = rt:Character()
@@ -1539,9 +1631,9 @@ local function GetNearestCoin(isFirstCoin: boolean?): Instance?
     local twinPredPos: Vector3? = nil
     local twinPlr: Player? = nil
 
-    if SETTINGS.TwinAvoidEnabled and cachedCleanTwin ~= "" then
+    if SETTINGS.TwinAvoidEnabled and next(cachedTwinSet) ~= nil then
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and string.lower(plr.Name) == cachedCleanTwin then
+            if plr ~= LocalPlayer and IsTwinPlayer(plr, plr.Name) then
                 if IsPlayerActuallyAlive(plr) then
                     local tChar = plr.Character
                     local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild("HumanoidRootPart") or tChar:FindFirstChildWhichIsA("BasePart"))
@@ -2128,19 +2220,6 @@ local function IsTargetVisible(label: TextLabel?): boolean
     return parent ~= nil and parent:IsA("GuiObject") and parent.Visible
 end
 
-local function CleanNickname(raw: string?): string
-    if not raw then return "" end
-    local cleaned = raw
-    cleaned = string.gsub(cleaned, "%[", "")
-    cleaned = string.gsub(cleaned, "%]", "")
-    cleaned = string.gsub(cleaned, "[\"\'%(%)]", "")
-    cleaned = string.gsub(cleaned, "^%s*[Tt]arget[:%s]*", "")
-    cleaned = string.gsub(cleaned, "^%s*[Ee]liminate[:%s]*", "")
-    cleaned = string.gsub(cleaned, "^%s*@?", "")
-    cleaned = string.gsub(cleaned, "^%s*(.-)%s*$", "%1")
-    return cleaned
-end
-
 local function FindPlayerByName(cleanName: string): (Player?, string)
     if cleanName == "" or cleanName == "Label" or cleanName == "None" then
         return nil, "Имя пусто"
@@ -2181,29 +2260,22 @@ local function RunTargetScan(): Player?
     return player
 end
 
--- === ПРОВЕРКА НА СОВПАДЕНИЕ С ТВИНКОМ ===
-local function IsTwinPlayer(targetPlayer: Player?, rawName: string?): boolean
-    local twin = cachedCleanTwin
-    if twin == "" then return false end
-
-    if targetPlayer then
-        if string.lower(targetPlayer.Name) == twin then return true end
-        if string.lower(targetPlayer.DisplayName) == twin then return true end
-    end
-
-    if rawName and rawName ~= "" then
-        local clean = CleanNickname(rawName)
-        if string.lower(clean) == twin then return true end
-    end
-
-    return false
-end
-
 -- === ПОДСЧЕТ ЖИВЫХ ИГРОКОВ В РАУНДЕ ===
 local function CountAliveRoundPlayers(): number
     local count = 0
     for _, plr in ipairs(Players:GetPlayers()) do
         if IsPlayerActuallyAlive(plr) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- === ПОДСЧЕТ ЖИВЫХ ВРАГОВ (БЕЗ НАС И НАШИХ ТВИНКОВ) ===
+local function CountAliveEnemies(): number
+    local count = 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and not IsTwinPlayer(plr, plr.Name) and IsPlayerActuallyAlive(plr) then
             count = count + 1
         end
     end
@@ -2361,8 +2433,8 @@ local function RunKillChain()
             end
 
             -- Резервная защита для режима с твинком
-            if SETTINGS.GameMode == "Twin" and aliveCount <= 2 then
-                UpdateStatus("Зачистка: Осталось 2 игрока (я + твинк). Стоп.", Color3.fromRGB(100, 255, 120))
+            if SETTINGS.GameMode == "Twin" and (aliveCount <= 2 or CountAliveEnemies() == 0) then
+                UpdateStatus("Зачистка: Врагов не осталось (только свои). Стоп.", Color3.fromRGB(100, 255, 120))
                 isChainRunning = false
                 return
             end
@@ -2446,8 +2518,8 @@ local function RunKillChain()
             -- Проверка количества живых игроков
             local aliveCount = CountAliveRoundPlayers()
             local stopLimit = (SETTINGS.RoundMode == "Clear") and 1 or 2
-            if aliveCount <= stopLimit then
-                UpdateStatus("Зачистка: " .. (aliveCount <= 1 and "Остался 1 участник (только вы)" or ("Осталось " .. aliveCount .. " участников")) .. ". Завершено.", Color3.fromRGB(100, 255, 120))
+            if aliveCount <= stopLimit or (SETTINGS.GameMode == "Twin" and CountAliveEnemies() == 0) then
+                UpdateStatus("Зачистка: " .. (aliveCount <= 1 and "Остался 1 участник (только вы)" or "Врагов не осталось") .. ". Завершено.", Color3.fromRGB(100, 255, 120))
                 break
             end
 
@@ -2552,9 +2624,8 @@ local function KillFinalTarget()
 
         -- В режиме с твинком твинка не трогаем даже при Kill All
         if SETTINGS.GameMode == "Twin" and IsTwinPlayer(target, target.Name) then
-            local count = CountAliveRoundPlayers()
-            if count <= 2 then
-                -- Остались только мы и твинк
+            if CountAliveEnemies() == 0 then
+                -- В живых только свои
                 break
             end
         end
@@ -2571,7 +2642,7 @@ local function KillFinalTarget()
         task.wait(0.08)
 
         local remaining = CountAliveRoundPlayers()
-        if remaining <= 1 or (SETTINGS.GameMode == "Twin" and remaining <= 2 and IsTwinPlayer(target, target.Name)) then
+        if remaining <= 1 or (SETTINGS.GameMode == "Twin" and CountAliveEnemies() == 0) then
             break
         end
     end
@@ -2593,7 +2664,6 @@ end
 
 
 -- Pre-declared UI references needed globally
-local ScreenGui
 local TPBtn, CloseBtn
 local startPos, dragEndConn: RBXScriptConnection?
 local RejoinPanel, RejoinCountdownLabel, BtnRejoinToggle, BtnServerMode
@@ -2609,11 +2679,12 @@ ScreenGui.Name = "MM2_AIO_Gui"
 ScreenGui.Parent = GetSafeGuiParent()
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+ScreenGui.Enabled = not InitialBypassActive
 
 -- Масштаб интерфейса (0.5 = уменьшен в 2 раза)
 local UI_SCALE = 0.5
 
-local MainFrame = Instance.new("Frame", ScreenGui)
+MainFrame = Instance.new("Frame", ScreenGui)
 MainFrame.Name = "MainFrame"
 MainFrame.Size = UDim2.new(0, 320, 0, 360)
 MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -3213,7 +3284,7 @@ TwinTextBox.Name = "TwinTextBox"
 TwinTextBox.Size = UDim2.new(0.72, -4, 1, 0)
 TwinTextBox.Position = UDim2.new(0, 0, 0, 0)
 TwinTextBox.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
-TwinTextBox.PlaceholderText = "Ник твинка..."
+TwinTextBox.PlaceholderText = "Ники твинков (через запятую)..."
 TwinTextBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 140)
 TwinTextBox.Text = SETTINGS.TwinName or ""
 TwinTextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -3329,12 +3400,12 @@ BindClick(SaveTwinBtn, function()
     local name = SanitizeTwinName(TwinTextBox.Text)
     TwinTextBox.Text = name
     SETTINGS.TwinName = name
-    cachedCleanTwin = string.lower(name)
+    UpdateTwinCache(name)
     local ok = SaveProfile(StatsPanel and StatsPanel.Visible, RejoinPanel and RejoinPanel.Visible)
     if ok then
-        UpdateStatus("Твинк сохранен в profile: " .. (name ~= "" and name or "(пусто)"), Color3.fromRGB(100, 255, 100))
+        UpdateStatus("Твинки сохранены в profile: " .. (name ~= "" and name or "(пусто)"), Color3.fromRGB(100, 255, 100))
     else
-        UpdateStatus("Твинк задан (ошибка сохранения profile)", Color3.fromRGB(255, 200, 100))
+        UpdateStatus("Твинки заданы (ошибка сохранения profile)", Color3.fromRGB(255, 200, 100))
     end
 end)
 
@@ -3342,7 +3413,7 @@ RegisterConnection(TwinTextBox.FocusLost:Connect(function()
     local clean = SanitizeTwinName(TwinTextBox.Text)
     TwinTextBox.Text = clean
     SETTINGS.TwinName = clean
-    cachedCleanTwin = string.lower(clean)
+    UpdateTwinCache(clean)
 end))
 
 -- Переключение режима: С ТВИНКОМ / СОЛО
