@@ -3175,6 +3175,38 @@ VoteSpamBtn.ZIndex = 10
 VoteSpamBtn.Visible = (SETTINGS.AutoVoteEnabled == true)
 Instance.new("UICorner", VoteSpamBtn).CornerRadius = UDim.new(0, 6)
 
+-- Временный ряд кнопок для ручной проверки обхода экрана Loading
+local TestBypassRow = Instance.new("Frame", SettingsContainer)
+TestBypassRow.Name = "TestBypassRow"
+TestBypassRow.Size = UDim2.new(1, 0, 0, 32)
+TestBypassRow.BackgroundTransparency = 1
+
+local TestSkipBtn = Instance.new("TextButton", TestBypassRow)
+TestSkipBtn.Name = "TestSkipBtn"
+TestSkipBtn.Size = UDim2.new(0.48, 0, 1, 0)
+TestSkipBtn.Position = UDim2.new(0, 0, 0, 0)
+TestSkipBtn.BackgroundColor3 = Color3.fromRGB(200, 120, 30)
+TestSkipBtn.Text = "⏩ SKIP LOAD"
+TestSkipBtn.TextColor3 = Color3.new(1, 1, 1)
+TestSkipBtn.Font = Enum.Font.GothamBold
+TestSkipBtn.TextSize = 11
+TestSkipBtn.Active = true
+TestSkipBtn.ZIndex = 10
+Instance.new("UICorner", TestSkipBtn).CornerRadius = UDim.new(0, 6)
+
+local TestForceBtn = Instance.new("TextButton", TestBypassRow)
+TestForceBtn.Name = "TestForceBtn"
+TestForceBtn.Size = UDim2.new(0.48, 0, 1, 0)
+TestForceBtn.Position = UDim2.new(0.52, 0, 0, 0)
+TestForceBtn.BackgroundColor3 = Color3.fromRGB(130, 45, 190)
+TestForceBtn.Text = "⚡ FORCE GUI"
+TestForceBtn.TextColor3 = Color3.new(1, 1, 1)
+TestForceBtn.Font = Enum.Font.GothamBold
+TestForceBtn.TextSize = 11
+TestForceBtn.Active = true
+TestForceBtn.ZIndex = 10
+Instance.new("UICorner", TestForceBtn).CornerRadius = UDim.new(0, 6)
+
 -- Подвал: строка состояния
 local StatusFrame = Instance.new("Frame", MainFrame)
 StatusFrame.Size = UDim2.new(1, 0, 0, 25)
@@ -3209,7 +3241,7 @@ UpdateGuiSizes = function()
 
     local settingsY = isStats and 192 or 107
     local extraH = (isTwin and 40 or 0) + (isVote and 40 or 0)
-    local settingsH = 205 + extraH
+    local settingsH = 245 + extraH
 
     SettingsContainer.Position = UDim2.new(0, 8, 0, settingsY)
     SettingsContainer.Size = UDim2.new(1, -16, 0, settingsH)
@@ -3219,6 +3251,103 @@ UpdateGuiSizes = function()
 end
 
 UpdateGuiSizes()
+
+-- Тестовая кнопка 1: Прожатие кнопки Skip в экране Loading
+BindClick(TestSkipBtn, function()
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then
+        UpdateStatus("Skip: PlayerGui не найден", Color3.fromRGB(255, 100, 100))
+        return
+    end
+    local loading = pGui:FindFirstChild("Loading")
+    if not loading then
+        UpdateStatus("Skip: экран Loading не найден", Color3.fromRGB(255, 200, 100))
+        return
+    end
+    local container = loading:FindFirstChild("Container")
+    local skipBtn = (container and container:FindFirstChild("Skip")) or loading:FindFirstChild("Skip", true)
+    if not skipBtn or not skipBtn:IsA("GuiButton") then
+        UpdateStatus("Skip: кнопка Skip не найдена в Loading", Color3.fromRGB(255, 100, 100))
+        return
+    end
+
+    local fired = false
+    local fs = firesignal or (syn and syn.firesignal)
+    if typeof(fs) == "function" then
+        pcall(function() fs(skipBtn.Activated) end)
+        pcall(function() fs(skipBtn.MouseButton1Click) end)
+        fired = true
+    end
+
+    local gc = getconnections or (syn and syn.getconnections)
+    if typeof(gc) == "function" then
+        for _, ev in ipairs({"Activated", "MouseButton1Click"}) do
+            local sOk, sig = pcall(function() return (skipBtn :: any)[ev] end)
+            if sOk and sig then
+                local cOk, conns = pcall(gc, sig)
+                if cOk and typeof(conns) == "table" and #conns > 0 then
+                    for _, c in ipairs(conns) do
+                        pcall(function() c:Fire() end)
+                    end
+                    fired = true
+                end
+            end
+        end
+    end
+
+    if fired then
+        UpdateStatus("Skip: сигнал отправлен!", Color3.fromRGB(100, 255, 100))
+    else
+        UpdateStatus("Skip: обработчики ещё не подключены", Color3.fromRGB(255, 180, 50))
+    end
+end)
+
+-- Тестовая кнопка 2: Принудительное развертывание MainGUI по коду MM2
+BindClick(TestForceBtn, function()
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then
+        UpdateStatus("Force: PlayerGui не найден", Color3.fromRGB(255, 100, 100))
+        return
+    end
+
+    local rep = game:GetService("ReplicatedStorage")
+    local guiFolder = rep:FindFirstChild("GUI")
+
+    local okClone = false
+    if guiFolder and not pGui:FindFirstChild("MainGUI") then
+        local tpl = guiFolder:FindFirstChild("MainPC") or guiFolder:FindFirstChild("MainMobile")
+        if tpl then
+            local clone = tpl:Clone()
+            clone.Name = "MainGUI"
+            clone.Parent = pGui
+            okClone = true
+        end
+    elseif pGui:FindFirstChild("MainGUI") then
+        okClone = true
+    end
+
+    local remotes = rep:FindFirstChild("Remotes")
+    local extras = remotes and remotes:FindFirstChild("Extras")
+    local loadedRem = extras and extras:FindFirstChild("LoadedCompletely")
+    if loadedRem and loadedRem:IsA("RemoteEvent") then
+        pcall(function() loadedRem:FireServer() end)
+    end
+
+    local loading = pGui:FindFirstChild("Loading")
+    if loading then
+        pcall(function() loading:Destroy() end)
+    end
+
+    pcall(function()
+        StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
+    end)
+
+    if okClone then
+        UpdateStatus("Force: MainGUI успешно активирован!", Color3.fromRGB(100, 255, 100))
+    else
+        UpdateStatus("Force: GUI не найден в ReplicatedStorage", Color3.fromRGB(255, 120, 120))
+    end
+end)
 
 -- Сохранение профиля по умолчанию в файл profile
 BindClick(SaveProfileBtn, function()
