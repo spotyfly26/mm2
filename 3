@@ -51,6 +51,42 @@ pcall(function()
     end
 end)
 
+-- === АВТОМАТИЧЕСКАЯ ОЧЕРЕДЬ ПРИ ТЕЛЕПОРТАЦИИ (QUEUE_ON_TELEPORT) ===
+-- Если вы делитесь raw-ссылкой (GitHub/Pastebin), вставьте её сюда:
+local SCRIPT_RAW_URL = ""
+
+local function QueueScriptForTeleport()
+    local qot = queue_on_teleport 
+        or (syn and syn.queue_on_teleport) 
+        or (fluxus and fluxus.queue_on_teleport)
+
+    if typeof(qot) == "function" then
+        pcall(function()
+            local payload = string.format([=[
+                pcall(function()
+                    local url = %q
+                    if url ~= "" then
+                        loadstring(game:HttpGet(url))()
+                    else
+                        local rf = readfile or (syn and syn.readfile)
+                        local isf = isfile or (syn and syn.isfile)
+                        if typeof(isf) == "function" and typeof(rf) == "function" then
+                            local searchFiles = {"20gm.lua", "scripts/20gm.lua", "autoexecute/20gm.lua"}
+                            for _, f in ipairs(searchFiles) do
+                                if isf(f) then
+                                    loadstring(rf(f))()
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end)
+            ]=], SCRIPT_RAW_URL)
+            qot(payload)
+        end)
+    end
+end
+
 local HttpService = game:GetService("HttpService")
 
 -- === СОХРАНЕНИЕ / ЗАГРУЗКА ПРОФИЛЯ ===
@@ -1198,7 +1234,6 @@ local EVENT_TOKENS_CONFIG = {
 
 local cachedTokensLabel: TextLabel? = nil
 local tokensChangedConn: RBXScriptConnection? = nil
-local tokensAncestryConn: RBXScriptConnection? = nil
 
 local function FindInventoryTokensLabel(): TextLabel?
     local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
@@ -1260,10 +1295,6 @@ local function HookInventoryTokensLabel(lbl: TextLabel)
         tokensChangedConn:Disconnect()
         tokensChangedConn = nil
     end
-    if tokensAncestryConn then
-        tokensAncestryConn:Disconnect()
-        tokensAncestryConn = nil
-    end
 
     cachedTokensLabel = lbl
     TotalInventoryTokens = lbl.Text
@@ -1280,24 +1311,28 @@ local function HookInventoryTokensLabel(lbl: TextLabel)
     end)
     RegisterConnection(tokensChangedConn)
 
-    tokensAncestryConn = lbl.AncestryChanged:Connect(function(_, parent)
+    local ancConn: RBXScriptConnection? = nil
+    ancConn = lbl.AncestryChanged:Connect(function(_, parent)
         if not parent or not lbl:IsDescendantOf(game) then
             if tokensChangedConn then
                 tokensChangedConn:Disconnect()
                 tokensChangedConn = nil
             end
-            if tokensAncestryConn then
-                tokensAncestryConn:Disconnect()
-                tokensAncestryConn = nil
+            if ancConn then
+                ancConn:Disconnect()
+                ancConn = nil
             end
             cachedTokensLabel = nil
         end
     end)
-    if tokensAncestryConn then RegisterConnection(tokensAncestryConn) end
+    if ancConn then RegisterConnection(ancConn) end
 end
 
 local function SetupInventoryTokensWatcher()
     task.spawn(function()
+        local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 15)
+        if not pGui then return end
+
         local function tryHook(): boolean
             if cachedTokensLabel and cachedTokensLabel.Parent and cachedTokensLabel:IsDescendantOf(game) then
                 return true
@@ -1310,18 +1345,39 @@ local function SetupInventoryTokensWatcher()
             return false
         end
 
-        -- Первая попытка при старте
         tryHook()
 
-        -- Спокойный опрос раз в 5 секунд:
-        -- 1. Если ссылка уже есть и жива — моментально пропускает (0% CPU).
-        -- 2. Если лейбл удалили/пересоздали (смена раунда) — тихо находит новую ссылку и вешает реактивный сигнал.
-        while not IsTerminated do
-            task.wait(5)
-            if not cachedTokensLabel or not cachedTokensLabel.Parent or not cachedTokensLabel:IsDescendantOf(game) then
+        -- Слушаем появление ScreenGui CrossPlatform
+        RegisterConnection(pGui.ChildAdded:Connect(function(child)
+            if child.Name == EVENT_TOKENS_CONFIG.ScreenGui then
+                task.wait(0.5)
                 tryHook()
+                RegisterConnection(child.DescendantAdded:Connect(function(desc)
+                    if desc:IsA("TextLabel") and (desc.Name == "TextLabel" or (desc.Parent and desc.Parent.Name == "Container")) then
+                        tryHook()
+                    end
+                end))
             end
+        end))
+
+        local cp = pGui:FindFirstChild(EVENT_TOKENS_CONFIG.ScreenGui) or pGui:FindFirstChild(EVENT_TOKENS_CONFIG.ScreenGui, true)
+        if cp then
+            RegisterConnection(cp.DescendantAdded:Connect(function(desc)
+                if desc:IsA("TextLabel") and (desc.Name == "TextLabel" or (desc.Parent and desc.Parent.Name == "Container")) then
+                    tryHook()
+                end
+            end))
         end
+
+        -- Легковесный watchdog: просыпается раз в 5 секунд ТОЛЬКО пока лейбл не найден
+        task.spawn(function()
+            while not IsTerminated do
+                if not cachedTokensLabel or not cachedTokensLabel.Parent then
+                    tryHook()
+                end
+                task.wait(5)
+            end
+        end)
     end)
 end
 
@@ -1785,10 +1841,10 @@ local function PreRoundKillChain()
 end
 
 -- =====================================================================
--- ДОБИВАНИЕ ОСТАВШИХСЯ ЦЕЛЕЙ ПРИ ПОЛНОЙ СУМКЕ (KILL ALL)
+-- ДОБИВАНИЕ ОСТАВШЕЙСЯ ЦЕЛИ ПРИ ПОЛНОЙ СУМКЕ (KILL ALL)
 -- =====================================================================
 local function KillFinalTarget()
-    UpdateStatus("Сумка полна: Kill All — зачистка всех игроков...", Color3.fromRGB(255, 80, 80))
+    UpdateStatus("Сумка полна: Добивание финальной цели...", Color3.fromRGB(255, 80, 80))
     local knife = InspectAndEquipKnife()
     if not knife then
         UpdateStatus("Kill All: Нож не найден в инвентаре!", Color3.fromRGB(255, 100, 100))
@@ -1796,38 +1852,21 @@ local function KillFinalTarget()
     end
 
     local killStart = tick()
-    while tick() - killStart < 15 and not IsTerminated and RoundInProgress() do
+    while tick() - killStart < 4 and not IsTerminated and RoundInProgress() do
         local target = RunTargetScan() or FindRemainingAlivePlayer()
         if not target then break end
 
-        -- В режиме с твинком твинка не трогаем даже при Kill All
-        if SETTINGS.GameMode == "Twin" and IsTwinPlayer(target, target.Name) then
-            local count = CountAliveRoundPlayers()
-            if count <= 2 then
-                -- Остались только мы и твинк
-                break
-            end
-        end
-
         local tChar = target.Character
         local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
-        if not tHum or tHum.Health <= 0 then
-            task.wait(0.05)
-            continue
-        end
+        if not tHum or tHum.Health <= 0 then break end
 
         knife = InspectAndEquipKnife() or knife
         TurboKill(target, knife)
-        task.wait(0.08)
-
-        local remaining = CountAliveRoundPlayers()
-        if remaining <= 1 or (SETTINGS.GameMode == "Twin" and remaining <= 2 and IsTwinPlayer(target, target.Name)) then
-            break
-        end
+        task.wait(0.05)
     end
 
     UnequipKnife()
-    UpdateStatus("Kill All: Зачистка завершена. Ожидание завершения раунда...", Color3.fromRGB(100, 255, 120))
+    UpdateStatus("Kill All: Раунд выигран! Победа.", Color3.fromRGB(100, 255, 120))
 end
 
 -- =====================================================================
@@ -2760,6 +2799,8 @@ DoRejoin = function(reason: string?)
     local targetReason = reason or "Таймер"
     print(string.format("[AutoRejoin] Запуск реконнекта (%s)...", targetReason))
     UpdateStatus("Реконнект (" .. targetReason .. ")...", Color3.fromRGB(255, 200, 100))
+    
+    QueueScriptForTeleport()
 
     pcall(function()
         GuiService:ClearError()
@@ -2799,6 +2840,7 @@ RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, t
     pcall(function()
         GuiService:ClearError()
     end)
+    QueueScriptForTeleport()
     pcall(function()
         TeleportService:Teleport(game.PlaceId, LocalPlayer)
     end)
@@ -3246,60 +3288,20 @@ local function ActionState()
 
     if not SETTINGS.AutoFarmEnabled or IsTerminated then return end
 
-    local function maintainHoverUntilRoundEnd()
-        local char = rt:Character()
-        local hrp = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart") :: BasePart?)
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if not hrp or not hum then return end
-
-        hum.PlatformStand = true
-
-        local hoverV = hrp:FindFirstChild("FarmVelocity") or Instance.new("BodyVelocity")
-        hoverV.Name = "FarmVelocity"
-        hoverV.Velocity = Vector3.zero
-        hoverV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-        hoverV.Parent = hrp
-
-        local hoverG = hrp:FindFirstChild("FarmGyro") or Instance.new("BodyGyro")
-        hoverG.Name = "FarmGyro"
-        hoverG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-        hoverG.CFrame = hrp.CFrame
-        hoverG.P = 3000
-        hoverG.Parent = hrp
-
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-
-        -- Удерживаем персонажа в воздухе на текущей точке до конца раунда
-        while not IsTerminated and RoundInProgress() and SETTINGS.AutoFarmEnabled and hum.Health > 0 do
-            hum.PlatformStand = true
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
-            task.wait(0.2)
-        end
-
-        if hoverV and hoverV.Parent then hoverV:Destroy() end
-        if hoverG and hoverG.Parent then hoverG:Destroy() end
-        if hum then hum.PlatformStand = false end
-    end
-
     -- 3. Действия при наполнении сумки или завершении раунда
     if BagIsFull then
         if SETTINGS.BagFullMode == "KillAll" then
-            -- Режим Kill All: добиваем всех оставшихся соперников
+            -- Режим Kill All: достаём нож и через TurboKill добиваем оставшуюся цель, забирая победу
             KillFinalTarget()
-            task.wait(0.3)
+            task.wait(0.5)
             BagIsFull = false
             ChangeState(State.WaitingForRoundEnd)
-            -- Остаемся парить на месте до завершения раунда, чтобы не упасть в бездну
-            maintainHoverUntilRoundEnd()
         elseif SETTINGS.BagFullMode == "AFK" then
-            -- Режим AFK: не делаем ресет и не убиваем игроков, остаемся парить на месте
+            -- Режим AFK: не делаем ресет и не убиваем игроков, просто ничего не делаем и ждём окончания раунда
             UnequipKnife()
-            UpdateStatus("Сумка полна: AFK (парение на месте)", Color3.fromRGB(170, 130, 255))
+            UpdateStatus("Сумка полна: AFK (ожидание)", Color3.fromRGB(170, 130, 255))
             BagIsFull = false
             ChangeState(State.WaitingForRoundEnd)
-            maintainHoverUntilRoundEnd()
         else
             -- Режим Reset: делаем сброс персонажа (BreakJoints). В живых остаётся только твинк/соперник
             UpdateStatus("Сумка полна: Сброс персонажа", Color3.fromRGB(200, 200, 200))
@@ -3682,16 +3684,6 @@ local function TerminateScript()
     table.clear(rt.potatoConnections)
     
     AutoFarmCleanUp()
-
-    if tokensChangedConn then
-        pcall(function() tokensChangedConn:Disconnect() end)
-        tokensChangedConn = nil
-    end
-    if tokensAncestryConn then
-        pcall(function() tokensAncestryConn:Disconnect() end)
-        tokensAncestryConn = nil
-    end
-    cachedTokensLabel = nil
     
     pcall(function()
         local char = LocalPlayer.Character
