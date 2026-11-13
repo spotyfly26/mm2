@@ -1183,6 +1183,67 @@ local function RoundInProgress(): boolean
     return rt:CheckIfGameInProgress()
 end
 
+-- =====================================================================
+-- УПРАВЛЕНИЕ ОРУЖИЕМ (ЭКИПИРОВКА И УДАЛЕНИЕ НОЖА В РЮКЗАК)
+-- =====================================================================
+local function InspectAndEquipKnife(): Tool?
+    local char = LocalPlayer.Character or rt:Character()
+    if not char then return nil end
+
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") and (item.Name == "Knife" or string.find(string.lower(item.Name), "knife")) then
+            return item
+        end
+    end
+
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then return nil end
+
+    local knife: Tool? = nil
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") and (item.Name == "Knife" or string.find(string.lower(item.Name), "knife")) then
+            knife = item
+            break
+        end
+    end
+    if not knife then knife = backpack:FindFirstChildOfClass("Tool") end
+    if not knife then return nil end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then pcall(function() hum:EquipTool(knife) end) end
+    if knife.Parent ~= char then pcall(function() knife.Parent = char end) end
+
+    task.wait(0.02)
+
+    local knifeClient = knife:FindFirstChild("KnifeClient") or knife:FindFirstChildWhichIsA("LocalScript")
+    if knifeClient and knifeClient:IsA("LocalScript") then
+        pcall(function() knifeClient.Disabled = true end)
+    end
+
+    return knife
+end
+
+local function UnequipKnife()
+    pcall(function()
+        local char = LocalPlayer.Character
+        if not char then return end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function() hum:UnequipTools() end)
+        end
+
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            for _, item in ipairs(char:GetChildren()) do
+                if item:IsA("Tool") then
+                    pcall(function() item.Parent = backpack end)
+                end
+            end
+        end
+    end)
+end
+
 -- === ГЛОБАЛЬНЫЕ СЕТЕВЫЕ СЛУШАТЕЛИ РАУНДА ===
 local function SetupRemoteHooks()
     local giveWeapon = FindRemoteEvent("GiveWeapon")
@@ -1319,7 +1380,7 @@ local function ClickGuiTarget(target: Instance): boolean
         local cx = absPos.X + absSize.X / 2
         local cy = absPos.Y + absSize.Y / 2
 
-        -- VirtualUser (встроенный сервис Roblox, работает почти во всех инжекторах)
+        -- VirtualUser (встроенный сервис Roblox, работает практически во всех инжекторах)
         if vu then
             pcall(function()
                 vu:CaptureController()
@@ -2157,67 +2218,6 @@ local function FindRemainingAlivePlayer(): Player?
         end
     end
     return nil
-end
-
--- =====================================================================
--- УПРАВЛЕНИЕ ОРУЖИЕМ (ЭКИПИРОВКА И УДАЛЕНИЕ НОЖА В РЮКЗАК)
--- =====================================================================
-local function InspectAndEquipKnife(): Tool?
-    local char = LocalPlayer.Character or rt:Character()
-    if not char then return nil end
-
-    for _, item in ipairs(char:GetChildren()) do
-        if item:IsA("Tool") and (item.Name == "Knife" or string.find(string.lower(item.Name), "knife")) then
-            return item
-        end
-    end
-
-    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
-    if not backpack then return nil end
-
-    local knife: Tool? = nil
-    for _, item in ipairs(backpack:GetChildren()) do
-        if item:IsA("Tool") and (item.Name == "Knife" or string.find(string.lower(item.Name), "knife")) then
-            knife = item
-            break
-        end
-    end
-    if not knife then knife = backpack:FindFirstChildOfClass("Tool") end
-    if not knife then return nil end
-
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum then pcall(function() hum:EquipTool(knife) end) end
-    if knife.Parent ~= char then pcall(function() knife.Parent = char end) end
-
-    task.wait(0.02)
-
-    local knifeClient = knife:FindFirstChild("KnifeClient") or knife:FindFirstChildWhichIsA("LocalScript")
-    if knifeClient and knifeClient:IsA("LocalScript") then
-        pcall(function() knifeClient.Disabled = true end)
-    end
-
-    return knife
-end
-
-local function UnequipKnife()
-    pcall(function()
-        local char = LocalPlayer.Character
-        if not char then return end
-
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            pcall(function() hum:UnequipTools() end)
-        end
-
-        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
-        if backpack then
-            for _, item in ipairs(char:GetChildren()) do
-                if item:IsA("Tool") then
-                    pcall(function() item.Parent = backpack end)
-                end
-            end
-        end
-    end)
 end
 
 -- =====================================================================
