@@ -1414,24 +1414,24 @@ end
 
 local function DismissDeviceSelect(devSelectGui: Instance)
     if IsTerminated then return end
-    print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Запуск цикла автовыбора Tablet...")
-    UpdateStatus("Выбор устройства: Tablet...", Color3.fromRGB(120, 200, 255))
+    print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Запуск цикла автовыбора Phone...")
+    UpdateStatus("Выбор устройства: Phone...", Color3.fromRGB(120, 200, 255))
     
     -- 1. Сетевой вызов (моментально регистрирует выбор на сервере MM2)
     local changeDevRemote = FindRemoteEvent("ChangeLastDevice")
     if changeDevRemote then
         pcall(function()
-            changeDevRemote:FireServer("Tablet")
+            changeDevRemote:FireServer("Phone")
         end)
     end
 
-    -- 2. Клиентская активация кнопки Tablet.Button (пульс до подтверждения игрой)
+    -- 2. Клиентская активация кнопки Phone.Button (пульс до подтверждения игрой)
     task.spawn(function()
         local startTime = os.clock()
         while not IsTerminated and devSelectGui and devSelectGui.Parent and (os.clock() - startTime < 15) do
             local container = devSelectGui:FindFirstChild("Container")
-            local tablet = container and container:FindFirstChild("Tablet")
-            local btn = tablet and tablet:FindFirstChild("Button")
+            local phone = container and (container:FindFirstChild("Phone") or container:FindFirstChild("Tablet"))
+            local btn = phone and phone:FindFirstChild("Button")
 
             if btn then
                 local btnTarget = btn
