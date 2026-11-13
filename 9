@@ -450,7 +450,7 @@ InitialBypassActive = CheckAnyStartupScreens()
 local isTeleporting = false
 local RejoinPending = false
 local RejoinStartTime = os.clock()
-local DoRejoin: (reason: string?, isManual: boolean?) -> () = function() end
+local DoRejoin: (reason: string?, isManual: boolean?, forceRandom: boolean?) -> () = function() end
 
 local function ChangeState(newState: string)
     CurrentState = newState
@@ -2934,10 +2934,10 @@ BtnRejoinToggle.Name = "BtnRejoinToggle"
 BtnRejoinToggle.Size = UDim2.new(1, -16, 0, 30)
 BtnRejoinToggle.Position = UDim2.new(0, 8, 0, 98)
 BtnRejoinToggle.BackgroundColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
-BtnRejoinToggle.Text = "РЕКОННЕКТ: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
+BtnRejoinToggle.Text = "ТАЙМЕР ПЕРЕЗАХОДА: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
 BtnRejoinToggle.TextColor3 = Color3.new(1, 1, 1)
 BtnRejoinToggle.Font = Enum.Font.GothamBold
-BtnRejoinToggle.TextSize = 12
+BtnRejoinToggle.TextSize = 11
 BtnRejoinToggle.Active = true
 BtnRejoinToggle.ZIndex = 10
 Instance.new("UICorner", BtnRejoinToggle).CornerRadius = UDim.new(0, 6)
@@ -3573,11 +3573,11 @@ local MAX_REJOIN_ATTEMPTS = 5
 local function IsFatalDisconnectMessage(msg: string?): boolean
     if typeof(msg) ~= "string" or msg == "" then return false end
     local lower = string.lower(msg)
-    if string.find(lower, "kick", 1, true)
-        or string.find(lower, "ban", 1, true)
-        or string.find(lower, "moderator", 1, true)
-        or string.find(lower, "same account", 1, true)
-        or string.find(lower, "267", 1, true)
+    -- Неперезаходимые ошибки: параллельный вход с другого устройства (273) или удаление/бан всего аккаунта Roblox
+    if string.find(lower, "same account", 1, true)
+        or string.find(lower, "different device", 1, true)
+        or string.find(lower, "account has been deleted", 1, true)
+        or string.find(lower, "banned from roblox", 1, true)
         or string.find(lower, "273", 1, true) then
         return true
     end
@@ -3586,16 +3586,16 @@ end
 
 BindClick(BtnRejoinToggle, function()
     SETTINGS.AutoRejoinEnabled = not SETTINGS.AutoRejoinEnabled
-    BtnRejoinToggle.Text = "РЕКОННЕКТ: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
+    BtnRejoinToggle.Text = "ТАЙМЕР ПЕРЕЗАХОДА: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
     BtnRejoinToggle.BackgroundColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
     if SETTINGS.AutoRejoinEnabled then
         RejoinStartTime = os.clock()
         RejoinPending = false
         rejoinAttempts = 0
-        UpdateStatus("Автореконнект активирован (" .. tostring(SETTINGS.RejoinTime) .. " с)", Color3.fromRGB(100, 255, 100))
+        UpdateStatus("Таймер перезахода активирован (" .. tostring(SETTINGS.RejoinTime) .. " с)", Color3.fromRGB(100, 255, 100))
     else
         RejoinPending = false
-        UpdateStatus("Автореконнект отключен", Color3.fromRGB(200, 100, 100))
+        UpdateStatus("Таймер перезахода отключен (реконнект при ошибках активен всегда)", Color3.fromRGB(200, 200, 200))
     end
 end)
 
@@ -3652,9 +3652,11 @@ BindClick(SaveRejoinBtn, function()
 end)
 
 -- Ядро выполнения реконнекта
-DoRejoin = function(reason: string?, isManual: boolean?)
+DoRejoin = function(reason: string?, isManual: boolean?, targetMode: string?)
     if isTeleporting or IsTerminated then return end
-    if not isManual and not SETTINGS.AutoRejoinEnabled then return end
+    local targetReason = reason or "Таймер"
+    local isTimer = string.find(string.lower(targetReason), "таймер", 1, true) ~= nil
+    if isTimer and not isManual and not SETTINGS.AutoRejoinEnabled then return end
     if not isManual and rejoinAttempts >= MAX_REJOIN_ATTEMPTS then
         warn("[AutoRejoin] Превышен лимит попыток реконнекта (" .. tostring(MAX_REJOIN_ATTEMPTS) .. "). Остановка.")
         UpdateStatus("Реконнект: лимит попыток исчерпан", Color3.fromRGB(255, 80, 80))
@@ -3664,7 +3666,6 @@ DoRejoin = function(reason: string?, isManual: boolean?)
     isTeleporting = true
     rejoinAttempts = rejoinAttempts + 1
 
-    local targetReason = reason or "Таймер"
     print(string.format("[AutoRejoin] Запуск реконнекта (%s, попытка %d/%d)...", targetReason, rejoinAttempts, MAX_REJOIN_ATTEMPTS))
     UpdateStatus(string.format("Реконнект (%s, #%d)...", targetReason, rejoinAttempts), Color3.fromRGB(255, 200, 100))
 
@@ -3673,7 +3674,9 @@ DoRejoin = function(reason: string?, isManual: boolean?)
     end)
     
     local success = false
-    if SETTINGS.RejoinServerMode == "Same" and typeof(game.JobId) == "string" and game.JobId ~= "" then
+    -- По умолчанию ВСЕГДА перезаходим на тот же сервер (JobId)
+    local preferSame = (targetMode ~= "Random") and (SETTINGS.RejoinServerMode == "Same" or not isTimer or targetMode == "Same")
+    if preferSame and typeof(game.JobId) == "string" and game.JobId ~= "" then
         UpdateStatus("Переход на текущий сервер (JobId)...", Color3.fromRGB(150, 200, 255))
         local ok, err = pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
@@ -3686,7 +3689,7 @@ DoRejoin = function(reason: string?, isManual: boolean?)
     end
     
     if not success then
-        UpdateStatus("Переход на случайный сервер...", Color3.fromRGB(150, 200, 255))
+        UpdateStatus("Переход на сервер игры...", Color3.fromRGB(150, 200, 255))
         pcall(function()
             TeleportService:Teleport(game.PlaceId, LocalPlayer)
         end)
@@ -3701,7 +3704,6 @@ end
 -- Обработка сбоя телепорта (сервер выключен, полон или недоступен)
 RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
     if IsTerminated or player ~= LocalPlayer then return end
-    if not isTeleporting and not SETTINGS.AutoRejoinEnabled then return end
     if IsFatalDisconnectMessage(errorMessage) then
         isTeleporting = false
         UpdateStatus("Реконнект отменен: фатальная ошибка", Color3.fromRGB(255, 80, 80))
@@ -3723,31 +3725,98 @@ RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, t
     pcall(function()
         GuiService:ClearError()
     end)
-    pcall(function()
-        TeleportService:Teleport(game.PlaceId, LocalPlayer)
-    end)
+    if typeof(game.JobId) == "string" and game.JobId ~= "" then
+        pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end)
+    else
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end
     isTeleporting = false
 end))
 
--- Отслеживание системных ошибок и дисконнектов через GuiService (только при включенном AutoRejoin и без кика/бана)
+-- Отслеживание системных ошибок и дисконнектов через GuiService (включая ошибку 267 и кик модератором)
 RegisterConnection(GuiService.ErrorMessageChanged:Connect(function(msg)
-    if IsTerminated or isTeleporting or not SETTINGS.AutoRejoinEnabled then return end
+    if IsTerminated or isTeleporting then return end
     if typeof(msg) == "string" and msg ~= "" then
         if IsFatalDisconnectMessage(msg) then
-            warn("[AutoRejoin] Обнаружен кик/бан/вход с другого устройства. Автореконнект отменен: " .. msg)
-            UpdateStatus("Кик/бан! Автореконнект остановлен", Color3.fromRGB(255, 80, 80))
+            warn("[AutoRejoin] Обнаружен вход с другого устройства или блокировка. Автореконнект отменен: " .. msg)
+            UpdateStatus("Вход с другого устройства! Стоп", Color3.fromRGB(255, 80, 80))
             return
         end
         if rejoinAttempts >= MAX_REJOIN_ATTEMPTS then return end
-        local waitSec = math.min(2 * (2 ^ rejoinAttempts), 30)
-        warn(string.format("[AutoRejoin] Обнаружен сбой сети GuiService: %s. Реконнект через %d с...", msg, waitSec))
-        UpdateStatus(string.format("Сбой сети! Реконнект через %dс...", waitSec), Color3.fromRGB(255, 80, 80))
+
+        local lower = string.lower(msg)
+        local isKick = string.find(lower, "267", 1, true)
+            or string.find(lower, "kick", 1, true)
+            or string.find(lower, "moderator", 1, true)
+
+        local waitSec = isKick and 3 or math.min(2 * (2 ^ rejoinAttempts), 30)
+        warn(string.format("[AutoRejoin] Обнаружен %s: %s. Перезаход на тот же сервер через %d с...", isKick and "кик (267)" or "сбой сети", msg, waitSec))
+        UpdateStatus(string.format("%s! Перезаход через %dс...", isKick and "Кик (267)" or "Сбой сети", waitSec), Color3.fromRGB(255, 80, 80))
         task.wait(waitSec)
-        if not IsTerminated and SETTINGS.AutoRejoinEnabled then
-            DoRejoin("Сбой сети / дисконнект", false)
+        if not IsTerminated then
+            DoRejoin(isKick and "Кик с сервера (267)" or "Сбой сети / дисконнект", false, "Same")
         end
     end
 end))
+
+-- Дублирующий перехватчик всплывающих окон ошибок через CoreGui (RobloxPromptGui)
+-- Срабатывает даже если ErrorMessageChanged не сработал или окно ошибки 267 отрисовалось только в CoreGui
+task.spawn(function()
+    local okCore, coreGui = pcall(function() return game:GetService("CoreGui") end)
+    if not okCore or not coreGui then return end
+
+    local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
+    if not promptGui then
+        pcall(function() promptGui = coreGui:WaitForChild("RobloxPromptGui", 10) end)
+    end
+    if not promptGui then return end
+
+    local promptOverlay = promptGui:FindFirstChild("promptOverlay")
+    if not promptOverlay then
+        pcall(function() promptOverlay = promptGui:WaitForChild("promptOverlay", 10) end)
+    end
+    if not promptOverlay then return end
+
+    local function OnErrorPrompt(child: Instance)
+        if IsTerminated or isTeleporting then return end
+        if not child or not child:IsA("GuiObject") then return end
+        task.wait(0.5)
+        if not child.Parent then return end
+
+        local msgLabel = child:FindFirstChild("ErrorMessage", true)
+        local msg = (msgLabel and msgLabel:IsA("TextLabel") and msgLabel.Text) or child.Name
+
+        if IsFatalDisconnectMessage(msg) then
+            warn("[AutoRejoin] Фатальная ошибка CoreGui. Остановка: " .. tostring(msg))
+            return
+        end
+
+        local lower = string.lower(msg)
+        local isKick = string.find(lower, "267", 1, true)
+            or string.find(lower, "kick", 1, true)
+            or string.find(lower, "moderator", 1, true)
+            or string.find(lower, "disconnect", 1, true)
+            or string.find(lower, "lost", 1, true)
+            or child.Name == "ErrorPrompt"
+
+        if isKick then
+            warn("[AutoRejoin] CoreGui обнаружил окно ошибки: " .. tostring(msg) .. ". Перезаход на тот же сервер...")
+            task.wait(2)
+            if not IsTerminated and not isTeleporting then
+                DoRejoin("Кик CoreGui (267)", false, "Same")
+            end
+        end
+    end
+
+    for _, c in ipairs(promptOverlay:GetChildren()) do
+        task.spawn(OnErrorPrompt, c)
+    end
+    RegisterConnection(promptOverlay.ChildAdded:Connect(OnErrorPrompt))
+end)
 
 -- Цикл обратного отсчета таймера и безопасного перезахода
 task.spawn(function()
