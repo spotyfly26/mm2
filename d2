@@ -159,11 +159,23 @@ local CurrentState = State.WaitingForRound
 local BagIsFull = false
 local Working = false
 
+-- === ГЛОБАЛЬНЫЕ ССЫЛКИ GUI И ФЛАГ БАЙПАСА СТАРТОВЫХ ЭКРАНОВ ===
+local ScreenGui: ScreenGui? = nil
+local MainFrame: Frame? = nil
+local InitialBypassActive = false
+
+local function CheckAnyStartupScreens(): boolean
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then return false end
+    return (pGui:FindFirstChild("Join") ~= nil) or (pGui:FindFirstChild("JoinPhone") ~= nil) or (pGui:FindFirstChild("DeviceSelect") ~= nil)
+end
+InitialBypassActive = CheckAnyStartupScreens()
+
 -- === ПЕРЕМЕННЫЕ АВТОРЕКОННЕКТА ===
 local isTeleporting = false
 local RejoinPending = false
 local RejoinStartTime = tick()
-local DoRejoin: (reason: string?) -> () = function() end
+local DoRejoin: (reason: string?, isManual: boolean?, targetMode: string?) -> () = function() end
 
 local function ChangeState(newState: string)
     CurrentState = newState
@@ -665,140 +677,226 @@ SetupRemoteHooks()
 -- =====================================================================
 -- АВТОМАТИЧЕСКИЙ ПРОПУСК ЭКРАНОВ ВХОДА (DEVICE SELECT & JOIN FRIENDS)
 -- =====================================================================
-local function DismissDeviceSelect(devSelectGui: Instance)
-    if IsTerminated then return end
-    print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Выполняем автовыбор Tablet...")
-    UpdateStatus("Выбор устройства: Tablet...", Color3.fromRGB(120, 200, 255))
-    
-    -- 1. Сетевой вызов (моментально регистрирует выбор на сервере MM2)
-    local changeDevRemote = FindRemoteEvent("ChangeLastDevice")
-    if changeDevRemote then
-        pcall(function()
-            changeDevRemote:FireServer("Tablet")
-        end)
+local function ClickGuiTarget(target: Instance): boolean
+    if not target or not target:IsA("GuiObject") then return false end
+
+    local clicked = false
+    local fs = firesignal or (syn and syn.firesignal)
+    local gc = getconnections or (syn and syn.getconnections)
+    local vim = game:GetService("VirtualInputManager")
+    local vu = game:GetService("VirtualUser")
+    local gs = game:GetService("GuiService")
+    local inset, _ = gs:GetGuiInset()
+
+    -- 1. firesignal (все варианты кликов и активаций)
+    if typeof(fs) == "function" then
+        pcall(function() fs((target :: any).MouseButton1Click) end)
+        pcall(function() fs((target :: any).Activated) end)
+        pcall(function() fs((target :: any).MouseButton1Down) end)
+        pcall(function() fs((target :: any).MouseButton1Up) end)
+        clicked = true
     end
 
-    -- 2. Клиентская активация кнопки Tablet.Button
-    local container = devSelectGui:FindFirstChild("Container")
-    local tablet = container and container:FindFirstChild("Tablet")
-    local btn = tablet and tablet:FindFirstChild("Button")
-    
-    if btn and btn:IsA("GuiButton") then
-        local gc = getconnections or (syn and syn.getconnections)
-        if typeof(gc) == "function" then
-            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
-                local sOk, sig = pcall(function() return (btn :: any)[evName] end)
-                if sOk and sig then
-                    local cOk, conns = pcall(gc, sig)
-                    if cOk and typeof(conns) == "table" then
-                        for _, c in ipairs(conns) do
-                            pcall(function() c:Fire() end)
+    -- 2. getconnections: прямой вызов функции обработчика c.Function() + c:Fire()
+    if typeof(gc) == "function" then
+        for _, evName in ipairs({"MouseButton1Click", "Activated", "MouseButton1Up"}) do
+            local sOk, sig = pcall(function() return (target :: any)[evName] end)
+            if sOk and sig then
+                local cOk, conns = pcall(gc, sig)
+                if cOk and typeof(conns) == "table" and #conns > 0 then
+                    for _, c in ipairs(conns) do
+                        if typeof(c) == "table" or typeof(c) == "userdata" then
+                            local fn = (c :: any).Function
+                            if typeof(fn) == "function" then
+                                pcall(task.spawn, fn)
+                                clicked = true
+                            end
+                            local fire = (c :: any).Fire
+                            if typeof(fire) == "function" then
+                                pcall(function() (c :: any):Fire() end)
+                                clicked = true
+                            end
                         end
                     end
                 end
             end
         end
-        
-        local fs = firesignal or (syn and syn.firesignal)
-        if typeof(fs) == "function" then
-            pcall(function() fs(btn.Activated) end)
-            pcall(function() fs(btn.MouseButton1Click) end)
+    end
+
+    -- 3. Аппаратный клик через координаты
+    if target.AbsoluteSize.X > 0 and target.AbsoluteSize.Y > 0 then
+        local wasGuiEnabled = (ScreenGui and ScreenGui.Enabled) == true
+        if wasGuiEnabled then
+            ScreenGui.Enabled = false
+        end
+
+        local absPos = target.AbsolutePosition
+        local absSize = target.AbsoluteSize
+        local cx = absPos.X + absSize.X / 2
+        local cy = absPos.Y + absSize.Y / 2
+
+        -- VirtualUser (встроенный сервис Roblox, работает практически во всех инжекторах)
+        if vu then
+            pcall(function()
+                vu:CaptureController()
+                vu:ClickButton1(Vector2.new(cx, cy))
+                if inset.Y > 0 or inset.X > 0 then
+                    vu:ClickButton1(Vector2.new(cx + inset.X, cy + inset.Y))
+                end
+            end)
+            clicked = true
+        end
+
+        -- VirtualInputManager (clickCount = 1 обязателен для генерации MouseButton1Click)
+        if vim then
+            pcall(function()
+                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 1)
+                task.wait(0.02)
+                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 1)
+
+                if inset.Y > 0 or inset.X > 0 then
+                    vim:SendMouseButtonEvent(cx + inset.X, cy + inset.Y, 0, true, game, 1)
+                    task.wait(0.02)
+                    vim:SendMouseButtonEvent(cx + inset.X, cy + inset.Y, 0, false, game, 1)
+                end
+            end)
+            clicked = true
+        end
+
+        if wasGuiEnabled and ScreenGui and not InitialBypassActive then
+            ScreenGui.Enabled = true
         end
     end
 
-    -- 3. Гарантированное скрытие интерфейса на клиенте
-    task.delay(0.3, function()
-        if devSelectGui and devSelectGui.Parent then
-            if devSelectGui:IsA("ScreenGui") then
-                devSelectGui.Enabled = false
+    return clicked
+end
+
+local function DismissDeviceSelect(devSelectGui: Instance)
+    if IsTerminated then return end
+    print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Запуск цикла автовыбора Phone...")
+    UpdateStatus("Выбор устройства: Phone...", Color3.fromRGB(120, 200, 255))
+    InitialBypassActive = true
+    if ScreenGui then ScreenGui.Enabled = false end
+
+    -- 1. Сетевой вызов (моментально регистрирует выбор на сервере MM2)
+    local changeDevRemote = FindRemoteEvent("ChangeLastDevice")
+    if changeDevRemote then
+        pcall(function()
+            changeDevRemote:FireServer("Phone")
+        end)
+    end
+
+    -- 2. Клиентская активация кнопки Phone.Button (с резервным fallback на Tablet)
+    task.spawn(function()
+        local startTime = os.clock()
+        while not IsTerminated and devSelectGui and devSelectGui.Parent and (os.clock() - startTime < 15) do
+            local container = devSelectGui:FindFirstChild("Container")
+            local phone = container and (container:FindFirstChild("Phone") or container:FindFirstChild("Tablet"))
+            local btn = phone and phone:FindFirstChild("Button")
+
+            if btn then
+                local btnTarget = btn
+                if not btnTarget:IsA("GuiButton") then
+                    btnTarget = btnTarget:FindFirstChildWhichIsA("GuiButton", true) or btnTarget
+                end
+                ClickGuiTarget(btnTarget)
             end
-            pcall(function() devSelectGui:Destroy() end)
+            task.wait(0.2)
+        end
+
+        if not CheckAnyStartupScreens() then
+            InitialBypassActive = false
+            if ScreenGui then ScreenGui.Enabled = true end
         end
     end)
 end
 
 local function DismissJoinPrompt(joinGui: Instance)
     if IsTerminated then return end
-    print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Нажимаем кнопку 'Play'...")
-    UpdateStatus("Пропуск окна друзей (Play)...", Color3.fromRGB(120, 200, 255))
-    
-    local friends = joinGui:FindFirstChild("Friends")
-    local playBtn = (friends and friends:FindFirstChild("Play")) or joinGui:FindFirstChild("Play", true)
-    
-    if playBtn and playBtn:IsA("GuiButton") then
-        local gc = getconnections or (syn and syn.getconnections)
-        if typeof(gc) == "function" then
-            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
-                local sOk, sig = pcall(function() return (playBtn :: any)[evName] end)
-                if sOk and sig then
-                    local cOk, conns = pcall(gc, sig)
-                    if cOk and typeof(conns) == "table" then
-                        for _, c in ipairs(conns) do
-                            pcall(function() c:Fire() end)
-                        end
-                    end
+    print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Ожидание готовности кнопки Play...")
+    UpdateStatus("Окно друзей: нажатие Play...", Color3.fromRGB(120, 200, 255))
+    InitialBypassActive = true
+    if ScreenGui then ScreenGui.Enabled = false end
+
+    task.spawn(function()
+        local startTime = os.clock()
+        while not IsTerminated and joinGui and joinGui.Parent and (os.clock() - startTime < 30) do
+            local friends = joinGui:FindFirstChild("Friends")
+            local playBtn = (friends and friends:FindFirstChild("Play"))
+                or joinGui:FindFirstChild("Play", true)
+
+            if playBtn then
+                local btnTarget = playBtn
+                if not btnTarget:IsA("GuiButton") then
+                    btnTarget = btnTarget:FindFirstChildWhichIsA("GuiButton", true) or btnTarget
                 end
+                ClickGuiTarget(btnTarget)
             end
-        end
-        
-        local fs = firesignal or (syn and syn.firesignal)
-        if typeof(fs) == "function" then
-            pcall(function() fs(playBtn.Activated) end)
-            pcall(function() fs(playBtn.MouseButton1Click) end)
+
+            task.wait(0.2)
         end
 
-        -- Эмуляция нажатия через VirtualInputManager
-        if playBtn:IsA("GuiObject") then
-            pcall(function()
-                local vim = game:GetService("VirtualInputManager")
-                local absPos = playBtn.AbsolutePosition
-                local absSize = playBtn.AbsoluteSize
-                local cx = absPos.X + absSize.X / 2
-                local cy = absPos.Y + absSize.Y / 2
-                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
-                task.wait(0.05)
-                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
-            end)
+        if not joinGui or not joinGui.Parent then
+            print("[MM2 AIO] Окно друзей (Join/Friends) успешно закрыто через Play! Родной цикл MM2 запущен.")
+            UpdateStatus("Окно друзей закрыто (Play)", Color3.fromRGB(100, 255, 100))
         end
-    end
 
-    -- Гарантированное скрытие интерфейса на клиенте
-    task.delay(0.3, function()
-        if joinGui and joinGui.Parent then
-            if joinGui:IsA("ScreenGui") then
-                joinGui.Enabled = false
-            end
-            pcall(function() joinGui:Destroy() end)
+        if not CheckAnyStartupScreens() then
+            InitialBypassActive = false
+            if ScreenGui then ScreenGui.Enabled = true end
         end
     end)
 end
 
 local function SetupInitialScreensBypass()
     task.spawn(function()
-        local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+        local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+        if not playerGui then
+            playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+        end
         if not playerGui then return end
 
-        -- Если экраны уже активны на момент старта
-        local existingDev = playerGui:FindFirstChild("DeviceSelect")
-        if existingDev then
-            DismissDeviceSelect(existingDev)
+        local function checkScreens()
+            if IsTerminated then return end
+            local dev = playerGui:FindFirstChild("DeviceSelect")
+            if dev then
+                DismissDeviceSelect(dev)
+            end
+            local join = playerGui:FindFirstChild("Join") or playerGui:FindFirstChild("JoinPhone")
+            if join then
+                DismissJoinPrompt(join)
+            end
         end
 
-        local existingJoin = playerGui:FindFirstChild("Join")
-        if existingJoin then
-            DismissJoinPrompt(existingJoin)
-        end
+        -- Немедленная проверка при старте
+        checkScreens()
 
-        -- Неблокирующее отслеживание появления экранов
+        -- Реакция на добавление экранов
         RegisterConnection(playerGui.ChildAdded:Connect(function(child)
             if child.Name == "DeviceSelect" then
-                task.wait(0.1)
+                task.wait(0.05)
                 DismissDeviceSelect(child)
-            elseif child.Name == "Join" then
-                task.wait(0.1)
+            elseif child.Name == "Join" or child.Name == "JoinPhone" then
+                task.wait(0.05)
                 DismissJoinPrompt(child)
             end
         end))
+
+        -- Фоновый дожим каждые 0.5с (на случай задержки загрузки или пропущенного ChildAdded)
+        task.spawn(function()
+            local watchStart = os.clock()
+            while not IsTerminated and (os.clock() - watchStart < 45) do
+                if playerGui:FindFirstChild("MainGUI") then
+                    break -- Игра штатно запущена
+                end
+                checkScreens()
+                task.wait(0.5)
+            end
+            if not CheckAnyStartupScreens() then
+                InitialBypassActive = false
+                if ScreenGui then ScreenGui.Enabled = true end
+            end
+        end)
     end)
 end
 SetupInitialScreensBypass()
@@ -1630,16 +1728,17 @@ local function GetSafeGuiParent()
     return LocalPlayer:WaitForChild("PlayerGui")
 end
 
-local ScreenGui = Instance.new("ScreenGui")
+ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "MM2_AIO_Gui"
 ScreenGui.Parent = GetSafeGuiParent()
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+ScreenGui.Enabled = not InitialBypassActive
 
 -- Масштаб интерфейса (0.5 = уменьшен в 2 раза)
 local UI_SCALE = 0.5
 
-local MainFrame = Instance.new("Frame", ScreenGui)
+MainFrame = Instance.new("Frame", ScreenGui)
 MainFrame.Name = "MainFrame"
 MainFrame.Size = UDim2.new(0, 320, 0, 360)
 MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -1804,13 +1903,13 @@ RejoinCountdownLabel.TextSize = 11
 RejoinCountdownLabel.TextXAlignment = Enum.TextXAlignment.Center
 RejoinCountdownLabel.TextWrapped = true
 
--- Кнопка переключения автореконнекта (ON / OFF)
+-- Кнопка переключения таймера автореконнекта (ON / OFF)
 local BtnRejoinToggle = Instance.new("TextButton", RejoinPanel)
 BtnRejoinToggle.Name = "BtnRejoinToggle"
 BtnRejoinToggle.Size = UDim2.new(1, -16, 0, 30)
 BtnRejoinToggle.Position = UDim2.new(0, 8, 0, 98)
 BtnRejoinToggle.BackgroundColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
-BtnRejoinToggle.Text = "РЕКОННЕКТ: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
+BtnRejoinToggle.Text = "ТАЙМЕР ПЕРЕЗАХОДА: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
 BtnRejoinToggle.TextColor3 = Color3.new(1, 1, 1)
 BtnRejoinToggle.Font = Enum.Font.GothamBold
 BtnRejoinToggle.TextSize = 12
@@ -2391,9 +2490,26 @@ BindClick(TPBtn, function()
     TPBtn.BackgroundColor3 = RejoinPanel.Visible and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(50, 50, 65)
 end)
 
+local rejoinAttempts = 0
+local MAX_REJOIN_ATTEMPTS = 5
+
+local function IsFatalDisconnectMessage(msg: string?): boolean
+    if typeof(msg) ~= "string" or msg == "" then return false end
+    local lower = string.lower(msg)
+    -- Неперезаходимые ошибки: параллельный вход с другого устройства (273) или удаление/бан всего аккаунта Roblox
+    if string.find(lower, "same account", 1, true)
+        or string.find(lower, "different device", 1, true)
+        or string.find(lower, "account has been deleted", 1, true)
+        or string.find(lower, "banned from roblox", 1, true)
+        or string.find(lower, "273", 1, true) then
+        return true
+    end
+    return false
+end
+
 BindClick(BtnRejoinToggle, function()
     SETTINGS.AutoRejoinEnabled = not SETTINGS.AutoRejoinEnabled
-    BtnRejoinToggle.Text = "РЕКОННЕКТ: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
+    BtnRejoinToggle.Text = "ТАЙМЕР ПЕРЕЗАХОДА: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
     BtnRejoinToggle.BackgroundColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
     if SETTINGS.AutoRejoinEnabled then
         RejoinStartTime = tick()
@@ -2435,7 +2551,7 @@ end)
 BindClick(BtnManualRejoin, function()
     UpdateStatus("Ручной перезаход запущен...", Color3.fromRGB(255, 180, 50))
     task.defer(function()
-        DoRejoin("Ручной запуск")
+        DoRejoin("Ручной запуск", true)
     end)
 end)
 
@@ -2457,20 +2573,31 @@ BindClick(SaveRejoinBtn, function()
 end)
 
 -- Ядро выполнения реконнекта
-DoRejoin = function(reason: string?)
+DoRejoin = function(reason: string?, isManual: boolean?, targetMode: string?)
     if isTeleporting or IsTerminated then return end
-    isTeleporting = true
-    
     local targetReason = reason or "Таймер"
-    print(string.format("[AutoRejoin] Запуск реконнекта (%s)...", targetReason))
-    UpdateStatus("Реконнект (" .. targetReason .. ")...", Color3.fromRGB(255, 200, 100))
-    
+    local isTimer = string.find(string.lower(targetReason), "таймер", 1, true) ~= nil
+    if isTimer and not isManual and not SETTINGS.AutoRejoinEnabled then return end
+    if not isManual and rejoinAttempts >= MAX_REJOIN_ATTEMPTS then
+        warn("[AutoRejoin] Превышен лимит попыток реконнекта (" .. tostring(MAX_REJOIN_ATTEMPTS) .. "). Остановка.")
+        UpdateStatus("Реконнект: лимит попыток исчерпан", Color3.fromRGB(255, 80, 80))
+        return
+    end
+
+    isTeleporting = true
+    rejoinAttempts = rejoinAttempts + 1
+
+    print(string.format("[AutoRejoin] Запуск реконнекта (%s, попытка %d/%d)...", targetReason, rejoinAttempts, MAX_REJOIN_ATTEMPTS))
+    UpdateStatus(string.format("Реконнект (%s, #%d)...", targetReason, rejoinAttempts), Color3.fromRGB(255, 200, 100))
+
     pcall(function()
         GuiService:ClearError()
     end)
     
     local success = false
-    if SETTINGS.RejoinServerMode == "Same" and typeof(game.JobId) == "string" and game.JobId ~= "" then
+    -- По умолчанию ВСЕГДА перезаходим на тот же сервер (JobId)
+    local preferSame = (targetMode ~= "Random") and (SETTINGS.RejoinServerMode == "Same" or not isTimer or targetMode == "Same")
+    if preferSame and typeof(game.JobId) == "string" and game.JobId ~= "" then
         UpdateStatus("Переход на текущий сервер (JobId)...", Color3.fromRGB(150, 200, 255))
         local ok, err = pcall(function()
             TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
@@ -2483,41 +2610,134 @@ DoRejoin = function(reason: string?)
     end
     
     if not success then
-        UpdateStatus("Переход на случайный сервер...", Color3.fromRGB(150, 200, 255))
+        UpdateStatus("Переход на сервер игры...", Color3.fromRGB(150, 200, 255))
         pcall(function()
             TeleportService:Teleport(game.PlaceId, LocalPlayer)
         end)
     end
     
-    task.delay(10, function()
+    local backoff = math.min(5 * (2 ^ (rejoinAttempts - 1)), 60)
+    task.delay(backoff, function()
         isTeleporting = false
     end)
 end
 
 -- Обработка сбоя телепорта (сервер выключен, полон или недоступен)
 RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+    if IsTerminated or player ~= LocalPlayer then return end
+    if IsFatalDisconnectMessage(errorMessage) then
+        isTeleporting = false
+        UpdateStatus("Реконнект отменен: фатальная ошибка", Color3.fromRGB(255, 80, 80))
+        return
+    end
+    if rejoinAttempts >= MAX_REJOIN_ATTEMPTS then
+        isTeleporting = false
+        warn("[AutoRejoin] Достигнут лимит попыток после сбоя телепорта.")
+        UpdateStatus("Реконнект: лимит попыток исчерпан", Color3.fromRGB(255, 80, 80))
+        return
+    end
+
+    rejoinAttempts = rejoinAttempts + 1
+    local waitSec = math.min(2 * (2 ^ (rejoinAttempts - 1)), 30)
+    warn(string.format("[AutoRejoin] Ошибка инициализации телепорта: %s (%s). Повтор #%d через %d с...", tostring(errorMessage), tostring(teleportResult), rejoinAttempts, waitSec))
+    UpdateStatus(string.format("Ошибка перехода. Повтор #%d через %dс...", rejoinAttempts, waitSec), Color3.fromRGB(255, 100, 100))
+    task.wait(waitSec)
     if IsTerminated then return end
-    warn(string.format("[AutoRejoin] Ошибка инициализации телепорта: %s (%s). Запасной переход на случайный сервер...", tostring(errorMessage), tostring(teleportResult)))
-    UpdateStatus("Ошибка перехода. Перезаход на случайный...", Color3.fromRGB(255, 100, 100))
-    task.wait(2)
     pcall(function()
         GuiService:ClearError()
     end)
-    pcall(function()
-        TeleportService:Teleport(game.PlaceId, LocalPlayer)
-    end)
+    if typeof(game.JobId) == "string" and game.JobId ~= "" then
+        pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end)
+    else
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end
+    isTeleporting = false
 end))
 
--- Отслеживание системных ошибок, дисконнектов и окон кика через GuiService
+-- Отслеживание системных ошибок и дисконнектов через GuiService (включая ошибку 267 и кик модератором)
 RegisterConnection(GuiService.ErrorMessageChanged:Connect(function(msg)
-    if IsTerminated or not SETTINGS.AutoRejoinEnabled or isTeleporting then return end
+    if IsTerminated or isTeleporting then return end
     if typeof(msg) == "string" and msg ~= "" then
-        warn("[AutoRejoin] Обнаружен дисконнект / ошибка GuiService: " .. msg)
-        UpdateStatus("Сбой сети/кик! Срочный реконнект...", Color3.fromRGB(255, 80, 80))
-        task.wait(0.5)
-        DoRejoin("Сбой сети / дисконнект")
+        if IsFatalDisconnectMessage(msg) then
+            warn("[AutoRejoin] Обнаружен вход с другого устройства или блокировка. Автореконнект отменен: " .. msg)
+            UpdateStatus("Вход с другого устройства! Стоп", Color3.fromRGB(255, 80, 80))
+            return
+        end
+        if rejoinAttempts >= MAX_REJOIN_ATTEMPTS then return end
+
+        local lower = string.lower(msg)
+        local isKick = string.find(lower, "267", 1, true)
+            or string.find(lower, "kick", 1, true)
+            or string.find(lower, "moderator", 1, true)
+
+        local waitSec = isKick and 3 or math.min(2 * (2 ^ rejoinAttempts), 30)
+        warn(string.format("[AutoRejoin] Обнаружен %s: %s. Перезаход на тот же сервер через %d с...", isKick and "кик (267)" or "сбой сети", msg, waitSec))
+        UpdateStatus(string.format("%s! Перезаход через %dс...", isKick and "Кик (267)" or "Сбой сети", waitSec), Color3.fromRGB(255, 80, 80))
+        task.wait(waitSec)
+        if not IsTerminated then
+            DoRejoin(isKick and "Кик с сервера (267)" or "Сбой сети / дисконнект", false, "Same")
+        end
     end
 end))
+
+-- Дублирующий перехватчик всплывающих окон ошибок через CoreGui (RobloxPromptGui)
+-- Срабатывает даже если ErrorMessageChanged не сработал или окно ошибки 267 отрисовалось только в CoreGui
+task.spawn(function()
+    local okCore, coreGui = pcall(function() return game:GetService("CoreGui") end)
+    if not okCore or not coreGui then return end
+
+    local promptGui = coreGui:FindFirstChild("RobloxPromptGui")
+    if not promptGui then
+        pcall(function() promptGui = coreGui:WaitForChild("RobloxPromptGui", 10) end)
+    end
+    if not promptGui then return end
+
+    local promptOverlay = promptGui:FindFirstChild("promptOverlay")
+    if not promptOverlay then
+        pcall(function() promptOverlay = promptGui:WaitForChild("promptOverlay", 10) end)
+    end
+    if not promptOverlay then return end
+
+    local function OnErrorPrompt(child: Instance)
+        if IsTerminated or isTeleporting then return end
+        if not child or not child:IsA("GuiObject") then return end
+        task.wait(0.5)
+        if not child.Parent then return end
+
+        local msgLabel = child:FindFirstChild("ErrorMessage", true)
+        local msg = (msgLabel and msgLabel:IsA("TextLabel") and msgLabel.Text) or child.Name
+
+        if IsFatalDisconnectMessage(msg) then
+            warn("[AutoRejoin] Фатальная ошибка CoreGui. Остановка: " .. tostring(msg))
+            return
+        end
+
+        local lower = string.lower(msg)
+        local isKick = string.find(lower, "267", 1, true)
+            or string.find(lower, "kick", 1, true)
+            or string.find(lower, "moderator", 1, true)
+            or string.find(lower, "disconnect", 1, true)
+            or string.find(lower, "lost", 1, true)
+            or child.Name == "ErrorPrompt"
+
+        if isKick then
+            warn("[AutoRejoin] CoreGui обнаружил окно ошибки: " .. tostring(msg) .. ". Перезаход на тот же сервер...")
+            task.wait(2)
+            if not IsTerminated and not isTeleporting then
+                DoRejoin("Кик CoreGui (267)", false, "Same")
+            end
+        end
+    end
+
+    for _, c in ipairs(promptOverlay:GetChildren()) do
+        task.spawn(OnErrorPrompt, c)
+    end
+    RegisterConnection(promptOverlay.ChildAdded:Connect(OnErrorPrompt))
+end)
 
 -- Цикл обратного отсчета таймера и безопасного перезахода
 task.spawn(function()
