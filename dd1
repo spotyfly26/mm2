@@ -99,7 +99,7 @@ local function SaveProfile(statsVisible: boolean?, rejoinVisible: boolean?): boo
 end
 
 local MAP_PRIORITIES = {
-    "Hospital 3", "House 2", "Office 3", "Bank 2", "Workplace",
+    "Hospital 3", "Manor", "House 2", "Office 3", "Bank 2", "Workplace",
     "Factory", "Mansion 2", "Police Station", "Research Facility",
     "Hotel 2", "Mil Base", "Bio Lab"
 }
