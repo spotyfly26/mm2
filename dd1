@@ -1,0 +1,3271 @@
+--!strict
+-- =====================================================================
+-- MM2 AUTO-FARM & ASSASSIN KILLER [MODERNIZED TURBO HYBRID]
+-- 1. Режимы зачистки: С ТВИНКОМ (остановка на твинке) / СОЛО (остановка при 2 игроках).
+-- 2. TurboKill: Двойной импульс touchinterest по хитбоксу без телепортов и зависаний.
+-- 3. Реактивный перехват ChangeTarget и RoundEndFade (0 мс задержки) + UI Watchdog.
+-- 4. Переключатель действия при полной сумке: РЕСЕТ / KILL ALL / AFK.
+-- 5. Сохранение всех настроек и ника твинка в profile.
+-- =====================================================================
+
+local HttpService = game:GetService("HttpService")
+
+-- === СОХРАНЕНИЕ / ЗАГРУЗКА ПРОФИЛЯ ===
+local PROFILE_FILE = "profile"
+
+local function LoadProfile(): { [string]: any }?
+    local rf = readfile or (syn and syn.readfile)
+    local isf = isfile or (syn and syn.isfile)
+    if typeof(isf) == "function" and typeof(rf) == "function" then
+        local targetFile = nil
+        local ok1, exists1 = pcall(isf, PROFILE_FILE)
+        if ok1 and exists1 then
+            targetFile = PROFILE_FILE
+        else
+            local ok2, exists2 = pcall(isf, PROFILE_FILE .. ".json")
+            if ok2 and exists2 then
+                targetFile = PROFILE_FILE .. ".json"
+            end
+        end
+
+        if targetFile then
+            local readOk, content = pcall(rf, targetFile)
+            if readOk and typeof(content) == "string" and content ~= "" then
+                local decodeOk, data = pcall(function()
+                    return HttpService:JSONDecode(content)
+                end)
+                if decodeOk and typeof(data) == "table" then
+                    return data
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local initialProfile = LoadProfile()
+local initialSavedTwin = (initialProfile and typeof(initialProfile.TwinName) == "string" and initialProfile.TwinName) or ""
+local isInitialRejoinPanel = (initialProfile and initialProfile.RejoinPanelVisible == true) or false
+
+-- === НАСТРОЙКИ СИСТЕМЫ И ПЕРЕМЕННЫЕ ===
+local SETTINGS = {
+    AutoFarmEnabled = (initialProfile and initialProfile.AutoFarmEnabled == true) or false,
+    AutoVoteEnabled = (initialProfile and initialProfile.AutoVoteEnabled == true) or false,
+    VoteSpamEnabled = (initialProfile and initialProfile.VoteSpamEnabled == true) or false,
+    Speed = (initialProfile and typeof(initialProfile.Speed) == "number" and initialProfile.Speed) or 22,
+    FpsCap = (initialProfile and typeof(initialProfile.FpsCap) == "number" and initialProfile.FpsCap) or 20,
+    PotatoMode = (initialProfile and initialProfile.PotatoMode == true) or false,
+    BagFullMode = (initialProfile and (initialProfile.BagFullMode == "KillAll" or initialProfile.BagFullMode == "Reset" or initialProfile.BagFullMode == "AFK") and initialProfile.BagFullMode) or "Reset",
+    GameMode = (initialProfile and (initialProfile.GameMode == "Twin" or initialProfile.GameMode == "Solo") and initialProfile.GameMode) or (initialSavedTwin ~= "" and "Twin" or "Solo"),
+    RoundMode = (initialProfile and (initialProfile.RoundMode == "Classic" or initialProfile.RoundMode == "Assassin") and initialProfile.RoundMode) or "Assassin",
+    TwinName = initialSavedTwin,
+    TwinAvoidEnabled = true, -- Умное разделение зон фарма с твинком (без гонок за одной монетой)
+    TwinAvoidRadius = 30, -- Компактная сфера влияния твинка (студы)
+    UnderfloorOffset = 3.8, -- Смещение под карту (студы ниже монеты)
+    AutoRejoinEnabled = (initialProfile and initialProfile.AutoRejoinEnabled == true) or false,
+    RejoinTime = (initialProfile and typeof(initialProfile.RejoinTime) == "number" and initialProfile.RejoinTime > 0 and initialProfile.RejoinTime) or 5400,
+    RejoinServerMode = (initialProfile and (initialProfile.RejoinServerMode == "Same" or initialProfile.RejoinServerMode == "Random") and initialProfile.RejoinServerMode) or "Same"
+}
+
+local function SaveProfile(statsVisible: boolean?, rejoinVisible: boolean?): boolean
+    local wf = writefile or (syn and syn.writefile)
+    if typeof(wf) == "function" then
+        local profileData = {
+            AutoFarmEnabled = (SETTINGS.AutoFarmEnabled == true),
+            AutoVoteEnabled = (SETTINGS.AutoVoteEnabled == true),
+            VoteSpamEnabled = (SETTINGS.VoteSpamEnabled == true),
+            Speed = SETTINGS.Speed or 22,
+            FpsCap = SETTINGS.FpsCap or 20,
+            PotatoMode = (SETTINGS.PotatoMode == true),
+            BagFullMode = SETTINGS.BagFullMode or "Reset",
+            GameMode = SETTINGS.GameMode or "Solo",
+            RoundMode = SETTINGS.RoundMode or "Assassin",
+            TwinName = SETTINGS.TwinName or "",
+            StatsPanelVisible = (statsVisible == true),
+            AutoRejoinEnabled = (SETTINGS.AutoRejoinEnabled == true),
+            RejoinTime = SETTINGS.RejoinTime or 5400,
+            RejoinServerMode = SETTINGS.RejoinServerMode or "Same",
+            RejoinPanelVisible = (rejoinVisible == true)
+        }
+        local encodeOk, jsonStr = pcall(function()
+            return HttpService:JSONEncode(profileData)
+        end)
+        if encodeOk and typeof(jsonStr) == "string" then
+            local writeOk = pcall(wf, PROFILE_FILE, jsonStr)
+            return writeOk
+        end
+    end
+    return false
+end
+
+local MAP_PRIORITIES = {
+    "Hospital 3", "House 2", "Office 3", "Bank 2", "Workplace",
+    "Factory", "Mansion 2", "Police Station", "Research Facility",
+    "Hotel 2", "Mil Base", "Bio Lab"
+}
+
+local StatsData = {
+    StartTime = 0,
+    CoinsCollected = 0
+}
+
+local CurrentRoundCoins = 0
+local ActiveCurrencyName = "Coin"
+local BagCoinCount = 0
+local HasVoted = false
+local IsTerminated = false -- Флаг полного завершения скрипта
+
+-- Список всех активных соединений (RBXScriptConnection) для гарантированного отключения
+local ActiveConnections: { RBXScriptConnection } = {}
+
+local function RegisterConnection(conn: RBXScriptConnection)
+    table.insert(ActiveConnections, conn)
+    return conn
+end
+
+-- === СЕРВИСЫ И ЯДРО ===
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local StarterGui = game:GetService("StarterGui")
+local VirtualUser = game:GetService("VirtualUser")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TeleportService = game:GetService("TeleportService")
+local GuiService = game:GetService("GuiService")
+
+while not Players.LocalPlayer do task.wait(0.1) end
+local LocalPlayer = Players.LocalPlayer
+
+local rt = {}
+rt.__index = rt
+rt.Players = Players
+rt.player = LocalPlayer
+rt.coinContainer = nil
+rt.touchedCoins = {}       
+rt.cachedCoins = {}
+rt.potatoConnections = {}
+rt.coinRemovedConn = nil   
+rt.ancestryConn = nil
+rt.cachedBodyParts = {}    
+
+local State = {
+    Action = "Action",
+    WaitingForRound = "WaitingForRound",
+    WaitingForRoundEnd = "WaitingForRoundEnd"
+}
+
+local CurrentState = State.WaitingForRound
+local BagIsFull = false
+local Working = false
+
+-- === ПЕРЕМЕННЫЕ АВТОРЕКОННЕКТА ===
+local isTeleporting = false
+local RejoinPending = false
+local RejoinStartTime = tick()
+local DoRejoin: (reason: string?) -> () = function() end
+
+local function ChangeState(newState: string)
+    CurrentState = newState
+    if newState == State.WaitingForRound then
+        BagCoinCount = 0
+        ActiveCurrencyName = "—"
+    end
+    if newState == State.WaitingForRound and RejoinPending and not isTeleporting and SETTINGS.AutoRejoinEnabled then
+        task.defer(function()
+            DoRejoin("Плановый таймер (раунд окончен)")
+        end)
+    end
+end
+
+-- Объявление UpdateStatus для логирования до инициализации UI
+local UpdateStatus: (text: string, color: Color3?) -> () = function() end
+
+function rt:Character() return self.player.Character or self.player.CharacterAdded:Wait() end
+function rt:GetCharacterLoaded() repeat task.wait(0.02) until rt:Character() ~= nil end
+
+-- === ОПТИМИЗИРОВАННЫЙ NOCLIP ===
+local isVotingNoclip = false
+
+local function updateBodyPartsCache()
+    table.clear(rt.cachedBodyParts)
+    local char = LocalPlayer.Character
+    if not char then return end
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") then
+            table.insert(rt.cachedBodyParts, v)
+        end
+    end
+end
+
+RegisterConnection(RunService.Stepped:Connect(function()
+    if IsTerminated then return end
+    if isVotingNoclip or (SETTINGS.AutoFarmEnabled and CurrentState == State.Action and rt:CheckIfPlayerWasInARound()) then
+        for _, part in ipairs(rt.cachedBodyParts) do
+            if part and part.Parent then
+                part.CanCollide = false
+            end
+        end
+    end
+end))
+
+-- =====================================================================
+-- ПОИСК СЕТЕВЫХ СОБЫТИЙ (REMOTE EVENT FINDER)
+-- =====================================================================
+local function FindRemoteEvent(name: string): RemoteEvent?
+    local direct = ReplicatedStorage:FindFirstChild(name)
+    if direct and direct:IsA("RemoteEvent") then return direct end
+    local deep = ReplicatedStorage:FindFirstChild(name, true)
+    if deep and deep:IsA("RemoteEvent") then return deep end
+    for _, item in ipairs(ReplicatedStorage:GetDescendants()) do
+        if item:IsA("RemoteEvent") and item.Name == name then
+            return item
+        end
+    end
+    return nil
+end
+
+-- Сетевые кэши состояния раунда и игроков
+local PlayerRolesCache: { [string]: string } = {}
+local PlayerAliveCache: { [string]: boolean } = {} -- true = мертв, false = жив
+
+local function IsPlayerActuallyAlive(plr: Player): boolean
+    local char = plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+
+    -- Строгая серверная проверка через PlayerAliveCache (синхронизируется через RoundStart / PlayerDataChanged):
+    -- nil   -> Не участвует в раунде (зритель / только зашёл на сервер)
+    -- true  -> Мёртв (Dead = true)
+    -- false -> Полноценно жив в раунде (Dead = false)
+    return PlayerAliveCache[plr.Name] == false
+end
+
+local function AutoFarmCleanUp()
+    table.clear(rt.touchedCoins)
+    table.clear(rt.cachedCoins)
+    if rt.Added then
+        rt.Added:Disconnect()
+        rt.Added = nil
+    end
+    if rt.coinRemovedConn then
+        rt.coinRemovedConn:Disconnect()
+        rt.coinRemovedConn = nil
+    end
+    if rt.ancestryConn then
+        rt.ancestryConn:Disconnect()
+        rt.ancestryConn = nil
+    end
+    rt.coinContainer = nil
+
+    -- Безопасная обратная очистка отключенных соединений из массива ActiveConnections
+    for i = #ActiveConnections, 1, -1 do
+        local conn = ActiveConnections[i]
+        if not conn or not conn.Connected then
+            table.remove(ActiveConnections, i)
+        end
+    end
+end
+
+-- === ПРОВЕРКА ЛИМИТА СУМКИ ===
+local function IsBagFull()
+    return BagIsFull
+end
+
+local function isCoinTouched(coin)
+    return rt.touchedCoins[coin] ~= nil
+end
+
+local function markCoinAsPending(coin)
+    if not rt then return end
+    rt.touchedCoins[coin] = "pending"
+    rt.cachedCoins[coin] = nil
+end
+
+-- === БЕЗОТКАЗНЫЙ ПОИСК МОНЕТ ===
+local function PopulateCoins()
+    table.clear(rt.cachedCoins)
+    if not rt.coinContainer then return end
+
+    if rt.Added then rt.Added:Disconnect(); rt.Added = nil end
+    if rt.coinRemovedConn then
+        rt.coinRemovedConn:Disconnect()
+        rt.coinRemovedConn = nil
+    end
+
+    -- Отслеживание удаления контейнера монет из Workspace
+    if rt.ancestryConn then
+        rt.ancestryConn:Disconnect()
+        rt.ancestryConn = nil
+    end
+    rt.ancestryConn = rt.coinContainer.AncestryChanged:Connect(function(_, parent)
+        if not parent or not rt.coinContainer or not rt.coinContainer:IsDescendantOf(Workspace) then
+            AutoFarmCleanUp()
+        end
+    end)
+
+    local function checkAndAdd(node)
+        if node:IsA("TouchTransmitter") and node.Parent and node.Parent:IsA("BasePart") then
+            rt.cachedCoins[node.Parent] = true
+        end
+    end
+
+    for _, desc in ipairs(rt.coinContainer:GetDescendants()) do
+        checkAndAdd(desc)
+    end
+
+    rt.Added = rt.coinContainer.DescendantAdded:Connect(checkAndAdd)
+
+    rt.coinRemovedConn = rt.coinContainer.ChildRemoved:Connect(function(child)
+        rt.cachedCoins[child] = nil
+        if child:IsA("Model") then
+            for _, p in ipairs(child:GetChildren()) do
+                rt.cachedCoins[p] = nil
+            end
+        end
+
+        local coin = child
+        local data = rt.touchedCoins[coin]
+
+        if not data and child:IsA("Model") then
+            local primary = child.PrimaryPart or child:FindFirstChildWhichIsA("BasePart")
+            if primary and rt.touchedCoins[primary] == "pending" then
+                coin = primary
+                data = "pending"
+            end
+        end
+
+        if data == "pending" then
+            rt.touchedCoins[coin] = "collected"
+            if IsBagFull() then BagIsFull = true end
+        end
+    end)
+end
+
+-- =====================================================================
+-- СИСТЕМА УЧЕТА КАРТЫ И МОНЕТ В WORKSPACE (ИЗ 44.LUA)
+-- =====================================================================
+local CurrentMapInstance: Instance? = nil
+local candidateConnections: { [Instance]: { RBXScriptConnection } } = {}
+
+local function DisconnectCandidate(child: Instance)
+    local conns = candidateConnections[child]
+    if conns then
+        for _, c in ipairs(conns) do
+            if c and c.Connected then pcall(function() c:Disconnect() end) end
+        end
+        candidateConnections[child] = nil
+    end
+end
+
+local function IsMapCandidate(child: Instance): boolean
+    if not child:IsA("Model") and not child:IsA("Folder") then return false end
+    if child == LocalPlayer.Character or (child:IsA("Model") and Players:GetPlayerFromCharacter(child)) then return false end
+    if child.Name == "Lobby" or child.Name == "Terrain" or child.Name == "Camera" then return false end
+    if child.Name == "RaycastFilter" or child.Name == "GunDrop" then return false end
+    return true
+end
+
+local function CleanupMap(child: Instance)
+    DisconnectCandidate(child)
+    if CurrentMapInstance == child then
+        CurrentMapInstance = nil
+        rt.coinContainer = nil
+        AutoFarmCleanUp()
+    end
+end
+
+local function RegisterMap(child: Instance, spawns: Instance?, container: Instance?)
+    if CurrentMapInstance == child then return end
+    CurrentMapInstance = child
+    DisconnectCandidate(child)
+
+    if container then
+        rt.coinContainer = container
+        if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
+            PopulateCoins()
+        end
+    else
+        local ccConn: RBXScriptConnection? = nil
+        ccConn = child.ChildAdded:Connect(function(newChild)
+            if newChild.Name == "CoinContainer" then
+                if ccConn then ccConn:Disconnect(); ccConn = nil end
+                rt.coinContainer = newChild
+                if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
+                    PopulateCoins()
+                end
+            end
+        end)
+        if ccConn then RegisterConnection(ccConn) end
+
+        task.spawn(function()
+            local cc = child:WaitForChild("CoinContainer", 15)
+            if cc and not rt.coinContainer and CurrentMapInstance == child then
+                rt.coinContainer = cc
+                if CurrentState == State.Action and SETTINGS.AutoFarmEnabled then
+                    PopulateCoins()
+                end
+            end
+        end)
+    end
+
+    local remConn = child.AncestryChanged:Connect(function(_, parent)
+        if not parent or parent ~= Workspace then
+            CleanupMap(child)
+        end
+    end)
+    RegisterConnection(remConn)
+end
+
+local function InspectMapCandidate(child: Instance)
+    if not IsMapCandidate(child) then return end
+    if CurrentMapInstance == child then return end
+
+    local container = child:FindFirstChild("CoinContainer")
+    local spawns = child:FindFirstChild("Spawns")
+
+    if container or spawns then
+        DisconnectCandidate(child)
+        RegisterMap(child, spawns, container)
+        return
+    end
+
+    if not candidateConnections[child] then
+        candidateConnections[child] = {}
+
+        local addConn = child.ChildAdded:Connect(function(newChild)
+            if newChild.Name == "Spawns" or newChild.Name == "CoinContainer" then
+                DisconnectCandidate(child)
+                if not IsTerminated and child.Parent == Workspace and CurrentMapInstance ~= child then
+                    local s = (newChild.Name == "Spawns") and newChild or child:FindFirstChild("Spawns")
+                    local c = (newChild.Name == "CoinContainer") and newChild or child:FindFirstChild("CoinContainer")
+                    RegisterMap(child, s, c)
+                end
+            end
+        end)
+        table.insert(candidateConnections[child], addConn)
+
+        local ancConn = child.AncestryChanged:Connect(function(_, parent)
+            if not parent or parent ~= Workspace then
+                DisconnectCandidate(child)
+            end
+        end)
+        table.insert(candidateConnections[child], ancConn)
+
+        task.spawn(function()
+            local foundSpawns = child:WaitForChild("Spawns", 15)
+            local foundContainer = child:FindFirstChild("CoinContainer")
+            if not IsTerminated and child.Parent == Workspace and (foundSpawns or foundContainer) then
+                DisconnectCandidate(child)
+                if CurrentMapInstance ~= child then
+                    RegisterMap(child, foundSpawns, foundContainer)
+                end
+            end
+        end)
+    end
+end
+
+local function DoForceCheckMap()
+    if CurrentMapInstance and CurrentMapInstance.Parent == Workspace then return end
+    for _, ch in ipairs(Workspace:GetChildren()) do
+        if IsMapCandidate(ch) and CurrentMapInstance ~= ch then
+            InspectMapCandidate(ch)
+            if CurrentMapInstance then break end
+            if not CurrentMapInstance and ch:IsA("Model") and #ch:GetChildren() > 5 then
+                RegisterMap(ch, ch:FindFirstChild("Spawns"), ch:FindFirstChild("CoinContainer"))
+                break
+            end
+        end
+    end
+end
+
+for _, ch in ipairs(Workspace:GetChildren()) do
+    InspectMapCandidate(ch)
+end
+
+RegisterConnection(Workspace.ChildAdded:Connect(function(child)
+    if IsTerminated then return end
+    task.defer(function()
+        InspectMapCandidate(child)
+    end)
+end))
+
+RegisterConnection(Workspace.ChildRemoved:Connect(function(child)
+    CleanupMap(child)
+end))
+
+-- === ПРОВЕРКА КАРТЫ И РАУНДА ===
+function rt:Map(): Instance?
+    if CurrentMapInstance and CurrentMapInstance.Parent == Workspace then
+        return CurrentMapInstance
+    end
+    return nil
+end
+
+function rt:CheckIfGameInProgress(): boolean
+    return rt:Map() ~= nil
+end
+
+-- Вспомогательная быстрая проверка видимости сумки игрока (fallback при старте скрипта посреди раунда)
+local function CheckBagGuiVisible(): boolean
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return false end
+    local mainGui = playerGui:FindFirstChild("MainGUI")
+    if not mainGui or not mainGui:IsA("ScreenGui") or not mainGui.Enabled then return false end
+
+    local gameObj = mainGui:FindFirstChild("Game")
+    local gameBags = gameObj and gameObj:FindFirstChild("CoinBags")
+    local dock = mainGui:FindFirstChild("Lobby") and mainGui.Lobby:FindFirstChild("Dock")
+    local dockBags = dock and dock:FindFirstChild("CoinBags")
+
+    local bagContainer = (gameBags and gameBags:FindFirstChild("Container")) or (dockBags and dockBags:FindFirstChild("Container"))
+    if not bagContainer then
+        local anyBags = mainGui:FindFirstChild("CoinBags", true)
+        bagContainer = anyBags and anyBags:FindFirstChild("Container")
+    end
+
+    if not bagContainer or not bagContainer:IsA("GuiObject") or not bagContainer.Visible then
+        return false
+    end
+
+    -- Проверяем видимость родительских фреймов
+    local curr: Instance? = bagContainer.Parent
+    while curr and curr:IsA("GuiObject") do
+        if not curr.Visible then return false end
+        if curr:IsA("CanvasGroup") and curr.GroupTransparency >= 1 then return false end
+        curr = curr.Parent
+    end
+
+    -- Проверяем наличие хотя бы одного видимого элемента сумки с ненулевым размером
+    for _, child in ipairs(bagContainer:GetChildren()) do
+        if child:IsA("GuiObject") and child.Visible and child.AbsoluteSize.X > 0 and child.AbsoluteSize.Y > 0 then
+            return true
+        end
+    end
+
+    return bagContainer.AbsoluteSize.X > 0 and bagContainer.AbsoluteSize.Y > 0
+end
+
+function rt:CheckIfPlayerWasInARound(): boolean
+    if not rt:Map() then return false end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+
+    -- Строгая серверная проверка (если уже получены сетевые пакеты):
+    -- true  -> Мёртв (Dead = true)
+    -- false -> В раунде и жив (Dead = false)
+    local cachedStatus = PlayerAliveCache[LocalPlayer.Name]
+    if cachedStatus ~= nil then
+        return cachedStatus == false
+    end
+
+    -- nil -> Ремоуты ещё не стреляли (скрипт запущен посреди уже идущего раунда).
+    -- Выполняем лёгкий fallback через видимость сумки на экране (CoinBags.Visible).
+    if CheckBagGuiVisible() then
+        PlayerAliveCache[LocalPlayer.Name] = false
+        return true
+    end
+
+    return false
+end
+
+function rt:IsElite(): boolean
+    return self.player:GetAttribute("Elite") == true
+end
+
+local function RoundInProgress(): boolean
+    return rt:CheckIfGameInProgress()
+end
+
+-- === ГЛОБАЛЬНЫЕ СЕТЕВЫЕ СЛУШАТЕЛИ РАУНДА ===
+local function SetupRemoteHooks()
+    local giveWeapon = FindRemoteEvent("GiveWeapon")
+    if giveWeapon then
+        RegisterConnection(giveWeapon.OnClientEvent:Connect(function(wName)
+            if IsTerminated then return end
+            if CurrentState == State.Action and SETTINGS.RoundMode == "Assassin" then
+                InspectAndEquipKnife()
+            end
+        end))
+    end
+
+    local roleSelect = FindRemoteEvent("RoleSelect")
+    if roleSelect then
+        RegisterConnection(roleSelect.OnClientEvent:Connect(function(role)
+            if IsTerminated then return end
+            DoForceCheckMap()
+            if role then PlayerRolesCache[LocalPlayer.Name] = tostring(role) end
+        end))
+    end
+
+    local roundStart = FindRemoteEvent("RoundStart")
+    if roundStart then
+        RegisterConnection(roundStart.OnClientEvent:Connect(function(_, playersData)
+            if IsTerminated then return end
+            DoForceCheckMap()
+            if typeof(playersData) == "table" then
+                for pName, pInfo in pairs(playersData) do
+                    if typeof(pInfo) == "table" then
+                        local sName = tostring(pName)
+                        if pInfo.Role ~= nil then PlayerRolesCache[sName] = tostring(pInfo.Role) end
+                        if pInfo.Dead ~= nil then PlayerAliveCache[sName] = (pInfo.Dead == true) end
+                    end
+                end
+            end
+        end))
+    end
+
+    local roundEnd = FindRemoteEvent("RoundEndFade")
+    if roundEnd then
+        RegisterConnection(roundEnd.OnClientEvent:Connect(function()
+            if IsTerminated then return end
+            if CurrentState == State.Action then
+                ChangeState(State.WaitingForRoundEnd)
+            end
+        end))
+    end
+
+    local playerDataChanged = FindRemoteEvent("PlayerDataChanged")
+    if playerDataChanged then
+        RegisterConnection(playerDataChanged.OnClientEvent:Connect(function(data)
+            if IsTerminated or typeof(data) ~= "table" then return end
+            local count = 0
+            for pName, pInfo in pairs(data) do
+                count = count + 1
+                if typeof(pInfo) == "table" then
+                    local sName = tostring(pName)
+                    if pInfo.Dead ~= nil then PlayerAliveCache[sName] = (pInfo.Dead == true) end
+                    if pInfo.Role ~= nil then PlayerRolesCache[sName] = tostring(pInfo.Role) end
+                end
+            end
+            if count == 0 then
+                table.clear(PlayerAliveCache)
+                table.clear(PlayerRolesCache)
+            end
+        end))
+    end
+
+    RegisterConnection(Players.PlayerRemoving:Connect(function(plr)
+        PlayerAliveCache[plr.Name] = nil
+        PlayerRolesCache[plr.Name] = nil
+    end))
+end
+SetupRemoteHooks()
+
+-- =====================================================================
+-- АВТОМАТИЧЕСКИЙ ПРОПУСК ЭКРАНОВ ВХОДА (DEVICE SELECT & JOIN FRIENDS)
+-- =====================================================================
+local function DismissDeviceSelect(devSelectGui: Instance)
+    if IsTerminated then return end
+    print("[MM2 AIO] Обнаружен экран выбора устройства (DeviceSelect). Выполняем автовыбор Tablet...")
+    UpdateStatus("Выбор устройства: Tablet...", Color3.fromRGB(120, 200, 255))
+    
+    -- 1. Сетевой вызов (моментально регистрирует выбор на сервере MM2)
+    local changeDevRemote = FindRemoteEvent("ChangeLastDevice")
+    if changeDevRemote then
+        pcall(function()
+            changeDevRemote:FireServer("Tablet")
+        end)
+    end
+
+    -- 2. Клиентская активация кнопки Tablet.Button
+    local container = devSelectGui:FindFirstChild("Container")
+    local tablet = container and container:FindFirstChild("Tablet")
+    local btn = tablet and tablet:FindFirstChild("Button")
+    
+    if btn and btn:IsA("GuiButton") then
+        local gc = getconnections or (syn and syn.getconnections)
+        if typeof(gc) == "function" then
+            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
+                local sOk, sig = pcall(function() return (btn :: any)[evName] end)
+                if sOk and sig then
+                    local cOk, conns = pcall(gc, sig)
+                    if cOk and typeof(conns) == "table" then
+                        for _, c in ipairs(conns) do
+                            pcall(function() c:Fire() end)
+                        end
+                    end
+                end
+            end
+        end
+        
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            pcall(function() fs(btn.Activated) end)
+            pcall(function() fs(btn.MouseButton1Click) end)
+        end
+    end
+
+    -- 3. Гарантированное скрытие интерфейса на клиенте
+    task.delay(0.3, function()
+        if devSelectGui and devSelectGui.Parent then
+            if devSelectGui:IsA("ScreenGui") then
+                devSelectGui.Enabled = false
+            end
+            pcall(function() devSelectGui:Destroy() end)
+        end
+    end)
+end
+
+local function DismissJoinPrompt(joinGui: Instance)
+    if IsTerminated then return end
+    print("[MM2 AIO] Обнаружено окно друзей (Join/Friends). Нажимаем кнопку 'Play'...")
+    UpdateStatus("Пропуск окна друзей (Play)...", Color3.fromRGB(120, 200, 255))
+    
+    local friends = joinGui:FindFirstChild("Friends")
+    local playBtn = (friends and friends:FindFirstChild("Play")) or joinGui:FindFirstChild("Play", true)
+    
+    if playBtn and playBtn:IsA("GuiButton") then
+        local gc = getconnections or (syn and syn.getconnections)
+        if typeof(gc) == "function" then
+            for _, evName in ipairs({"Activated", "MouseButton1Click"}) do
+                local sOk, sig = pcall(function() return (playBtn :: any)[evName] end)
+                if sOk and sig then
+                    local cOk, conns = pcall(gc, sig)
+                    if cOk and typeof(conns) == "table" then
+                        for _, c in ipairs(conns) do
+                            pcall(function() c:Fire() end)
+                        end
+                    end
+                end
+            end
+        end
+        
+        local fs = firesignal or (syn and syn.firesignal)
+        if typeof(fs) == "function" then
+            pcall(function() fs(playBtn.Activated) end)
+            pcall(function() fs(playBtn.MouseButton1Click) end)
+        end
+
+        -- Эмуляция нажатия через VirtualInputManager
+        if playBtn:IsA("GuiObject") then
+            pcall(function()
+                local vim = game:GetService("VirtualInputManager")
+                local absPos = playBtn.AbsolutePosition
+                local absSize = playBtn.AbsoluteSize
+                local cx = absPos.X + absSize.X / 2
+                local cy = absPos.Y + absSize.Y / 2
+                vim:SendMouseButtonEvent(cx, cy, 0, true, game, 0)
+                task.wait(0.05)
+                vim:SendMouseButtonEvent(cx, cy, 0, false, game, 0)
+            end)
+        end
+    end
+
+    -- Гарантированное скрытие интерфейса на клиенте
+    task.delay(0.3, function()
+        if joinGui and joinGui.Parent then
+            if joinGui:IsA("ScreenGui") then
+                joinGui.Enabled = false
+            end
+            pcall(function() joinGui:Destroy() end)
+        end
+    end)
+end
+
+local function SetupInitialScreensBypass()
+    task.spawn(function()
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+        if not playerGui then return end
+
+        -- Если экраны уже активны на момент старта
+        local existingDev = playerGui:FindFirstChild("DeviceSelect")
+        if existingDev then
+            DismissDeviceSelect(existingDev)
+        end
+
+        local existingJoin = playerGui:FindFirstChild("Join")
+        if existingJoin then
+            DismissJoinPrompt(existingJoin)
+        end
+
+        -- Неблокирующее отслеживание появления экранов
+        RegisterConnection(playerGui.ChildAdded:Connect(function(child)
+            if child.Name == "DeviceSelect" then
+                task.wait(0.1)
+                DismissDeviceSelect(child)
+            elseif child.Name == "Join" then
+                task.wait(0.1)
+                DismissJoinPrompt(child)
+            end
+        end))
+    end)
+end
+SetupInitialScreensBypass()
+
+local function GetNearestCoin(): Instance?
+    local char = rt:Character()
+    if not char or not char.PrimaryPart then return nil end
+
+    local myPos = char.PrimaryPart.Position
+
+    -- Поиск позиции и вектора движения твинка (1 раз за вызов — 0.0001 мс, 0% CPU)
+    local twinPos: Vector3? = nil
+    local twinPredPos: Vector3? = nil
+    local twinPlr: Player? = nil
+    local twinName = SETTINGS.TwinName
+
+    if SETTINGS.TwinAvoidEnabled and twinName and twinName ~= "" then
+        local cleanTwin = string.lower(string.gsub(twinName, "^%s*(.-)%s*$", "%1"))
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and string.lower(plr.Name) == cleanTwin then
+                if IsPlayerActuallyAlive(plr) then
+                    local tChar = plr.Character
+                    local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild("HumanoidRootPart") or tChar:FindFirstChildWhichIsA("BasePart"))
+                    if tHrp then
+                        twinPos = tHrp.Position
+                        twinPlr = plr
+                        -- Векторное упреждение полета: определяем курс движения твинка на 1.5–2 сек вперед
+                        local vel = tHrp.AssemblyLinearVelocity
+                        if vel and vel.Magnitude > 3 then
+                            twinPredPos = twinPos + (vel.Unit * math.min(vel.Magnitude * 1.8, 50))
+                        end
+                    end
+                end
+                break
+            end
+        end
+    end
+
+    local bestCoin = nil
+    local bestDist = math.huge
+
+    local fallbackCoin = nil
+    local fallbackDist = math.huge
+
+    local avoidRadius = SETTINGS.TwinAvoidRadius or 30
+
+    for coin, _ in pairs(rt.cachedCoins) do
+        if coin and rt.coinContainer and coin.Parent == rt.coinContainer and not isCoinTouched(coin) and coin:FindFirstChildWhichIsA("TouchTransmitter") then
+            local coinPos = coin.Position
+            local myDist = (coinPos - myPos).Magnitude
+
+            -- Всегда сохраняем абсолютную ближайшую монету (fallback, если вся карта зачищена)
+            if myDist < fallbackDist then
+                fallbackDist = myDist
+                fallbackCoin = coin
+            end
+
+            -- Проверка принадлежности монеты твинку (сокращенные радиусы + защита ближней зоны)
+            local isTwinZone = false
+            if twinPos then
+                -- Если монета в пределах 12 студов от нас — забираем без уступок
+                if myDist > 12 then
+                    local twinDist = (coinPos - twinPos).Magnitude
+                    local predDist = twinPredPos and (coinPos - twinPredPos).Magnitude or math.huge
+
+                    -- 1) Монета в непосредственном радиусе твинка (30 студов)
+                    -- 2) Монета на пути полета твинка (в радиусе 18 студов от вектора)
+                    -- 3) Твинк строго ближе к этой монете, чем мы (диаграмма Вороного)
+                    -- 4) При равном расстоянии тай-брейкер по имени
+                    if (twinDist < avoidRadius)
+                        or (predDist < 18)
+                        or (twinDist < myDist)
+                        or (twinDist == myDist and twinPlr and LocalPlayer.Name < twinPlr.Name) then
+                        isTwinZone = true
+                    end
+                end
+            end
+
+            if not isTwinZone then
+                if myDist < bestDist then
+                    bestDist = myDist
+                    bestCoin = coin
+                end
+            end
+        else
+            rt.cachedCoins[coin] = nil
+        end
+    end
+
+    return bestCoin or fallbackCoin
+end
+
+local function BindClick(guiElement, callback)
+    local debounce = false
+    local function fire()
+        if debounce or IsTerminated then return end
+        debounce = true
+        task.spawn(callback)
+        task.wait(0.15)
+        debounce = false
+    end
+    guiElement.Activated:Connect(fire)
+    guiElement.MouseButton1Click:Connect(fire)
+    guiElement.TouchTap:Connect(fire)
+end
+
+-- === УНИВЕРСАЛЬНЫЙ UI-ПАРСЕР СУМКИ (ТЕЛЕФОН / ПЛАНШЕТ / ПК) ===
+local function SetupBagParser()
+    task.spawn(function()
+        local playerGui = LocalPlayer:WaitForChild("PlayerGui", 15)
+        if not playerGui then return end
+
+        local hookedContainers: { [Instance]: boolean } = {}
+
+        -- Полная проверка реальной видимости на экране (по аналогии с votepads)
+        local function isBagActuallyVisible(bagFrame: GuiObject, coinsLabel: TextLabel?): boolean
+            if not bagFrame.Visible then return false end
+            if coinsLabel and (not coinsLabel.Visible or coinsLabel.TextTransparency >= 1) then
+                return false
+            end
+            if bagFrame.AbsoluteSize.X <= 0 or bagFrame.AbsoluteSize.Y <= 0 then
+                return false
+            end
+
+            -- Проверка предков вплоть до ScreenGui
+            local curr: Instance? = bagFrame.Parent
+            while curr and curr:IsA("GuiObject") do
+                if not (curr :: GuiObject).Visible then
+                    return false
+                end
+                if curr:IsA("CanvasGroup") and (curr :: CanvasGroup).GroupTransparency >= 1 then
+                    return false
+                end
+                curr = curr.Parent
+            end
+            return true
+        end
+
+        local function hookContainer(container: Instance)
+            if not container or hookedContainers[container] then return end
+            hookedContainers[container] = true
+
+            local function bindToCurrencyBag(bagFrame: Instance)
+                if not bagFrame:IsA("GuiObject") then return end
+
+                local currencyFrame = bagFrame:FindFirstChild("CurrencyFrame") or bagFrame:WaitForChild("CurrencyFrame", 2)
+                local icon = currencyFrame and (currencyFrame:FindFirstChild("Icon") or currencyFrame:WaitForChild("Icon", 2))
+                local coinsLabel = icon and (icon:FindFirstChild("Coins") or icon:WaitForChild("Coins", 2)) :: TextLabel?
+
+                -- coinsLabel — единственный строго обязательный элемент для подсчета монет
+                if not coinsLabel or not coinsLabel:IsA("TextLabel") then return end
+
+                -- Опциональные индикаторы заполненности (не блокируют привязку, если их нет)
+                local fullLabel = bagFrame:FindFirstChild("Full") :: TextLabel?
+                local fullBagIcon = bagFrame:FindFirstChild("FullBagIcon") :: ImageLabel?
+
+                local lastCount = tonumber(coinsLabel.Text) or 0
+
+                local function checkFull()
+                    if not isBagActuallyVisible(bagFrame, coinsLabel) then return end
+                    local count = tonumber(coinsLabel.Text) or 0
+                    
+                    if count < 40 then
+                        BagIsFull = false
+                        return
+                    end
+
+                    local isFull = false
+
+                    if fullLabel and fullLabel.Visible and fullLabel.TextTransparency < 1 and fullLabel.Text == "Full!" then
+                        isFull = true
+                    end
+
+                    local fullBagIcon = bagFrame:FindFirstChild("FullBagIcon")
+                    if fullBagIcon and fullBagIcon:IsA("ImageLabel") and fullBagIcon.Visible and fullBagIcon.ImageTransparency < 1 then
+                        isFull = true
+                    end
+
+                    local isEvent = (bagFrame.Name ~= "Coin")
+                    local maxLimit = isEvent and 50 or (rt:IsElite() and 50 or 40)
+
+                    if count >= maxLimit then
+                        isFull = true
+                    end
+
+                    BagIsFull = isFull
+                end
+
+                -- Реактивное обновление при изменении текста количества монет
+                RegisterConnection(coinsLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                    if IsTerminated then return end
+                    if not isBagActuallyVisible(bagFrame, coinsLabel) then return end
+
+                    local currentCount = tonumber(coinsLabel.Text) or 0
+                    if currentCount > lastCount then
+                        local gained = currentCount - lastCount
+                        StatsData.CoinsCollected = StatsData.CoinsCollected + gained
+                        BagCoinCount = currentCount
+                        CurrentRoundCoins = currentCount
+                        ActiveCurrencyName = bagFrame.Name
+                    elseif currentCount < lastCount then
+                        BagCoinCount = currentCount
+                        CurrentRoundCoins = currentCount
+                    end
+
+                    lastCount = currentCount
+                    checkFull()
+                end))
+
+                -- Проверка при изменении видимости самого фрейма
+                RegisterConnection(bagFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+                    if IsTerminated then return end
+                    if RoundInProgress() and isBagActuallyVisible(bagFrame, coinsLabel) then
+                        ActiveCurrencyName = bagFrame.Name
+                        BagCoinCount = tonumber(coinsLabel.Text) or 0
+                        checkFull()
+                    end
+                end))
+
+                -- Проверка при изменении видимости всех предков (Container -> CoinBags -> Game/Dock)
+                local currParent: Instance? = bagFrame.Parent
+                while currParent and currParent:IsA("GuiObject") do
+                    local pObj = currParent :: GuiObject
+                    RegisterConnection(pObj:GetPropertyChangedSignal("Visible"):Connect(function()
+                        if IsTerminated then return end
+                        if RoundInProgress() and isBagActuallyVisible(bagFrame, coinsLabel) then
+                            ActiveCurrencyName = bagFrame.Name
+                            BagCoinCount = tonumber(coinsLabel.Text) or 0
+                            checkFull()
+                        end
+                    end))
+                    currParent = currParent.Parent
+                end
+
+                if fullLabel then
+                    RegisterConnection(fullLabel:GetPropertyChangedSignal("Visible"):Connect(function()
+                        if IsTerminated then return end
+                        checkFull()
+                    end))
+
+                    RegisterConnection(fullLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                        if IsTerminated then return end
+                        checkFull()
+                    end))
+
+                    RegisterConnection(fullLabel:GetPropertyChangedSignal("TextTransparency"):Connect(function()
+                        if IsTerminated then return end
+                        checkFull()
+                    end))
+                end
+
+                if fullBagIcon then
+                    RegisterConnection(fullBagIcon:GetPropertyChangedSignal("Visible"):Connect(function()
+                        if IsTerminated then return end
+                        checkFull()
+                    end))
+
+                    RegisterConnection(fullBagIcon:GetPropertyChangedSignal("ImageTransparency"):Connect(function()
+                        if IsTerminated then return end
+                        checkFull()
+                    end))
+                end
+
+                -- Начальная инициализация при старте
+                if RoundInProgress() and isBagActuallyVisible(bagFrame, coinsLabel) then
+                    ActiveCurrencyName = bagFrame.Name
+                    BagCoinCount = tonumber(coinsLabel.Text) or 0
+                    checkFull()
+                end
+            end
+
+            for _, bag in ipairs(container:GetChildren()) do
+                bindToCurrencyBag(bag)
+            end
+
+            RegisterConnection(container.ChildAdded:Connect(function(child)
+                if IsTerminated then return end
+                bindToCurrencyBag(child)
+            end))
+        end
+
+        local function scanAndHookContainers(mainGui: Instance)
+            if mainGui.Name ~= "MainGUI" then return end
+
+            -- 1. Режим Планшета / ПК / Игры: MainGUI.Game.CoinBags.Container
+            local gameObj = mainGui:FindFirstChild("Game")
+            local gameBags = gameObj and gameObj:FindFirstChild("CoinBags")
+            local gameContainer = gameBags and gameBags:FindFirstChild("Container")
+            if gameContainer then
+                hookContainer(gameContainer)
+            end
+
+            -- 2. Режим Телефона: MainGUI.Lobby.Dock.CoinBags.Container
+            local lobby = mainGui:FindFirstChild("Lobby")
+            local dock = lobby and lobby:FindFirstChild("Dock")
+            local dockBags = dock and dock:FindFirstChild("CoinBags")
+            local dockContainer = dockBags and dockBags:FindFirstChild("Container")
+            if dockContainer then
+                hookContainer(dockContainer)
+            end
+
+            -- 3. Резервный моментальный поиск в глубину (если путь нестандартный)
+            if not gameContainer and not dockContainer then
+                local anyBags = mainGui:FindFirstChild("CoinBags", true)
+                local anyContainer = anyBags and anyBags:FindFirstChild("Container")
+                if anyContainer then
+                    hookContainer(anyContainer)
+                end
+            end
+
+            -- 4. Реактивный перехват динамического появления Container без постоянных циклов
+            RegisterConnection(mainGui.DescendantAdded:Connect(function(desc)
+                if IsTerminated then return end
+                if desc.Name == "Container" and desc.Parent and desc.Parent.Name == "CoinBags" then
+                    hookContainer(desc)
+                end
+            end))
+        end
+
+        local existingMain = playerGui:FindFirstChild("MainGUI")
+        if existingMain then
+            task.spawn(scanAndHookContainers, existingMain)
+        end
+
+        RegisterConnection(playerGui.ChildAdded:Connect(function(child)
+            if child.Name == "MainGUI" then
+                task.spawn(scanAndHookContainers, child)
+            end
+        end))
+    end)
+end
+
+SetupBagParser()
+
+-- =====================================================================
+-- UI ПОИСК И ОЧИСТКА ИМЕНИ ЦЕЛИ
+-- =====================================================================
+local function FindTargetLabel(): (TextLabel?, string)
+    local pGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then return nil, "PlayerGui не найден" end
+
+    local mGui = pGui:FindFirstChild("MainGUI")
+    if mGui then
+        local gameObj = mGui:FindFirstChild("Game")
+        if gameObj then
+            local targetFrame = gameObj:FindFirstChild("AssassinTarget")
+            if targetFrame then
+                local label = targetFrame:FindFirstChild("TargetName")
+                if label and label:IsA("TextLabel") then
+                    return label, "MainGUI.Game.AssassinTarget.TargetName"
+                end
+            end
+        end
+    end
+
+    local altFrame = pGui:FindFirstChild("AssassinTarget", true)
+    if altFrame then
+        local label = altFrame:FindFirstChild("TargetName")
+        if label and label:IsA("TextLabel") then
+            return label, altFrame:GetFullName() .. ".TargetName"
+        end
+    end
+
+    local anyLabel = pGui:FindFirstChild("TargetName", true)
+    if anyLabel and anyLabel:IsA("TextLabel") then
+        return anyLabel, anyLabel:GetFullName()
+    end
+
+    return nil, "TargetName не найден"
+end
+
+local function IsTargetVisible(label: TextLabel?): boolean
+    if not label or not label.Visible then return false end
+    local parent = label.Parent
+    return parent ~= nil and parent:IsA("GuiObject") and parent.Visible
+end
+
+local function CleanNickname(raw: string?): string
+    if not raw then return "" end
+    local cleaned = raw
+    cleaned = string.gsub(cleaned, "%[", "")
+    cleaned = string.gsub(cleaned, "%]", "")
+    cleaned = string.gsub(cleaned, "[\"\'%(%)]", "")
+    cleaned = string.gsub(cleaned, "^%s*[Tt]arget[:%s]*", "")
+    cleaned = string.gsub(cleaned, "^%s*[Ee]liminate[:%s]*", "")
+    cleaned = string.gsub(cleaned, "^%s*@?", "")
+    cleaned = string.gsub(cleaned, "^%s*(.-)%s*$", "%1")
+    return cleaned
+end
+
+local function FindPlayerByName(cleanName: string): (Player?, string)
+    if cleanName == "" or cleanName == "Label" or cleanName == "None" then
+        return nil, "Имя пусто"
+    end
+
+    local exact = Players:FindFirstChild(cleanName)
+    if exact then return exact, "Exact" end
+
+    local lowerClean = string.lower(cleanName)
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LocalPlayer then
+            if string.lower(pl.Name) == lowerClean or string.lower(pl.DisplayName) == lowerClean then
+                return pl, "Match"
+            end
+        end
+    end
+
+    for _, pl in ipairs(Players:GetPlayers()) do
+        if pl ~= LocalPlayer then
+            if string.find(string.lower(pl.Name), lowerClean, 1, true)
+               or string.find(string.lower(pl.DisplayName), lowerClean, 1, true) then
+                return pl, "Partial"
+            end
+        end
+    end
+
+    return nil, "Не найден"
+end
+
+local function RunTargetScan(): Player?
+    local label = FindTargetLabel()
+    if not label or not IsTargetVisible(label) then return nil end
+
+    local rawText = label.Text
+    local cleaned = CleanNickname(rawText)
+    if cleaned == "" or cleaned == "Label" or cleaned == "None" then return nil end
+
+    local player = FindPlayerByName(cleaned)
+    return player
+end
+
+-- === ПРОВЕРКА НА СОВПАДЕНИЕ С ТВИНКОМ ===
+local function IsTwinPlayer(targetPlayer: Player?, rawName: string?): boolean
+    local twin = string.lower(string.gsub(SETTINGS.TwinName or "", "^%s*(.-)%s*$", "%1"))
+    if twin == "" then return false end
+
+    if targetPlayer then
+        if string.lower(targetPlayer.Name) == twin then return true end
+        if string.lower(targetPlayer.DisplayName) == twin then return true end
+    end
+
+    if rawName and rawName ~= "" then
+        local clean = CleanNickname(rawName)
+        if string.lower(clean) == twin then return true end
+    end
+
+    return false
+end
+
+-- === ПОДСЧЕТ ЖИВЫХ ИГРОКОВ В РАУНДЕ ===
+local function CountAliveRoundPlayers(): number
+    local count = 0
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if IsPlayerActuallyAlive(plr) then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- === ПОИСК ПОСЛЕДНЕГО ОСТАВШЕГОСЯ СОПЕРНИКА ===
+local function FindRemainingAlivePlayer(): Player?
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and IsPlayerActuallyAlive(plr) then
+            return plr
+        end
+    end
+    return nil
+end
+
+-- =====================================================================
+-- УПРАВЛЕНИЕ ОРУЖИЕМ (ЭКИПИРОВКА И УДАЛЕНИЕ НОЖА В РЮКЗАК)
+-- =====================================================================
+local function InspectAndEquipKnife(): Tool?
+    local char = LocalPlayer.Character or rt:Character()
+    if not char then return nil end
+
+    for _, item in ipairs(char:GetChildren()) do
+        if item:IsA("Tool") and (item.Name == "Knife" or string.find(string.lower(item.Name), "knife")) then
+            return item
+        end
+    end
+
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+    if not backpack then return nil end
+
+    local knife: Tool? = nil
+    for _, item in ipairs(backpack:GetChildren()) do
+        if item:IsA("Tool") and (item.Name == "Knife" or string.find(string.lower(item.Name), "knife")) then
+            knife = item
+            break
+        end
+    end
+    if not knife then knife = backpack:FindFirstChildOfClass("Tool") end
+    if not knife then return nil end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then pcall(function() hum:EquipTool(knife) end) end
+    if knife.Parent ~= char then pcall(function() knife.Parent = char end) end
+
+    task.wait(0.02)
+
+    local knifeClient = knife:FindFirstChild("KnifeClient") or knife:FindFirstChildWhichIsA("LocalScript")
+    if knifeClient and knifeClient:IsA("LocalScript") then
+        pcall(function() knifeClient.Disabled = true end)
+    end
+
+    return knife
+end
+
+local function UnequipKnife()
+    pcall(function()
+        local char = LocalPlayer.Character
+        if not char then return end
+
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function() hum:UnequipTools() end)
+        end
+
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack") or LocalPlayer:FindFirstChild("Backpack")
+        if backpack then
+            for _, item in ipairs(char:GetChildren()) do
+                if item:IsA("Tool") then
+                    pcall(function() item.Parent = backpack end)
+                end
+            end
+        end
+    end)
+end
+
+-- =====================================================================
+-- БЕСШУМНЫЙ СЕТЕВОЙ ТУРБО-УДАР (SILENT REMOTE KILL ИЗ V4.2)
+-- =====================================================================
+local function TurboKill(targetPlayer: Player, knife: Tool): boolean
+    local targetChar = targetPlayer.Character
+    if not targetChar then return false end
+
+    local targetHRP = (targetChar:FindFirstChild("HumanoidRootPart") 
+        or targetChar:FindFirstChild("UpperTorso") 
+        or targetChar:FindFirstChild("Torso") 
+        or targetChar.PrimaryPart) :: BasePart?
+    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+    if not targetHRP or not targetHum or targetHum.Health <= 0 then
+        return false
+    end
+
+    -- Сервер MM2 требует, чтобы нож находился в Character для валидации владельца
+    local myChar = LocalPlayer.Character
+    if myChar and knife.Parent ~= myChar then
+        pcall(function() knife.Parent = myChar end)
+    end
+
+    local events = knife:FindFirstChild("Events")
+    local stabEvent = events and events:FindFirstChild("KnifeStabbed") :: RemoteEvent?
+    local touchEvent = events and events:FindFirstChild("HandleTouched") :: RemoteEvent?
+
+    -- 1. СЕТЕВОЙ МЕТОД: Взвод урона и касание через внутренние RemoteEvents ножа (БЕЗ взмаха и анимации!)
+    if stabEvent and touchEvent then
+        pcall(function() stabEvent:FireServer() end)
+        pcall(function() touchEvent:FireServer(targetHRP) end)
+        return true
+    end
+
+    -- 2. Резервный метод: если нож без Events, используем классический импульс
+    pcall(function() knife:Activate() end)
+    local handle = knife:FindFirstChild("Handle") or knife:FindFirstChildWhichIsA("BasePart")
+    local touchFn = firetouchinterest or firetouchtransmitter or (syn and syn.firetouchinterest)
+    if handle and touchFn then
+        pcall(function()
+            touchFn(targetHRP, handle, 0)
+            touchFn(targetHRP, handle, 1)
+        end)
+        return true
+    end
+    return false
+end
+
+-- =====================================================================
+-- НОВАЯ ЛОГИКА ПРЕДВАРИТЕЛЬНОЙ ЗАЧИСТКИ (PreRoundKillChain)
+-- =====================================================================
+local function PreRoundKillChain()
+    if not RoundInProgress() or not rt:CheckIfPlayerWasInARound() then return end
+
+    local knife = InspectAndEquipKnife()
+    if not knife then
+        UpdateStatus("Зачистка: Ожидание выдачи ножа сервером...", Color3.fromRGB(255, 200, 100))
+        local waitKnifeStart = tick()
+        while not knife and tick() - waitKnifeStart < 30 and not IsTerminated and RoundInProgress() and rt:CheckIfPlayerWasInARound() and CurrentState == State.Action and not BagIsFull and SETTINGS.RoundMode == "Assassin" do
+            task.wait(0.2)
+            knife = InspectAndEquipKnife()
+        end
+    end
+
+    if not knife then
+        UpdateStatus("Зачистка: Нож не выдан сервером", Color3.fromRGB(255, 120, 120))
+        return
+    end
+
+    -- Отключаем KnifeClient скрипт ножа, чтобы случайно не убить рядом проходящих игроков во время полета
+    local knifeClient = knife:FindFirstChild("KnifeClient") or knife:FindFirstChildWhichIsA("LocalScript")
+    if knifeClient and knifeClient:IsA("LocalScript") then
+        pcall(function() knifeClient.Disabled = true end)
+    end
+
+    UpdateStatus("Зачистка: Старт цепочки (" .. (SETTINGS.GameMode == "Twin" and "С Твинком" or "Соло") .. ")", Color3.fromRGB(255, 180, 50))
+
+    local isChainRunning = true
+    local activeTargetPlayer: Player? = nil
+    local activeTargetName = ""
+    local changeTargetEvent = FindRemoteEvent("ChangeTarget")
+    local roundEndEvent = FindRemoteEvent("RoundEndFade")
+
+    local netTargetConn: RBXScriptConnection? = nil
+    local netEndConn: RBXScriptConnection? = nil
+    local uiTextConn: RBXScriptConnection? = nil
+
+    local function TryEliminateTarget(plr: Player, rawName: string?)
+        if not isChainRunning or IsTerminated or SETTINGS.RoundMode ~= "Assassin" then
+            isChainRunning = false
+            return
+        end
+        if not plr or not plr.Character then return end
+
+        local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then return end
+
+        -- 1. Проверка режима "С ТВИНКОМ": если цель Твинк — зачистка моментально останавливается!
+        if SETTINGS.GameMode == "Twin" and IsTwinPlayer(plr, rawName) then
+            UpdateStatus("Зачистка: Цель — Твинк (" .. plr.DisplayName .. ")! Стоп.", Color3.fromRGB(100, 255, 120))
+            isChainRunning = false
+            return
+        end
+
+        -- 2. Проверка количества живых игроков
+        local aliveCount = CountAliveRoundPlayers()
+
+        -- Режим "СОЛО": если в раунде осталось 2 игрока (я + 1 соперник) — цель убивать нельзя!
+        if SETTINGS.GameMode == "Solo" and aliveCount <= 2 then
+            UpdateStatus("Зачистка: Осталось 2 игрока (я + соперник). Стоп.", Color3.fromRGB(100, 255, 120))
+            isChainRunning = false
+            return
+        end
+
+        -- Резервная защита для режима с твинком
+        if SETTINGS.GameMode == "Twin" and aliveCount <= 2 then
+            UpdateStatus("Зачистка: Осталось 2 игрока (я + твинк). Стоп.", Color3.fromRGB(100, 255, 120))
+            isChainRunning = false
+            return
+        end
+
+        -- 3. Нанесение удара через TurboKill
+        knife = InspectAndEquipKnife() or knife
+        TurboKill(plr, knife)
+        UpdateStatus("Удар: " .. plr.DisplayName .. " (Живых: " .. aliveCount .. ")", Color3.fromRGB(255, 80, 80))
+    end
+
+    -- Сетевой перехват ChangeTarget (0 мс задержки)
+    if changeTargetEvent then
+        netTargetConn = changeTargetEvent.OnClientEvent:Connect(function(targetName: any, _, _, targetUserId: any)
+            if not isChainRunning or IsTerminated then return end
+
+            local targetPlr: Player? = nil
+            if typeof(targetUserId) == "number" and targetUserId > 0 then
+                targetPlr = Players:GetPlayerByUserId(targetUserId)
+            end
+            if not targetPlr and typeof(targetName) == "string" and targetName ~= "" then
+                targetPlr = Players:FindFirstChild(targetName) or FindPlayerByName(targetName)
+            end
+
+            if targetPlr then
+                activeTargetPlayer = targetPlr
+                activeTargetName = targetPlr.Name
+                TryEliminateTarget(targetPlr, tostring(targetName or ""))
+            end
+        end)
+    end
+
+    -- Сетевой перехват окончания раунда
+    if roundEndEvent then
+        netEndConn = roundEndEvent.OnClientEvent:Connect(function()
+            UpdateStatus("Зачистка: Раунд завершён (RoundEndFade)", Color3.fromRGB(100, 255, 120))
+            isChainRunning = false
+        end)
+    end
+
+    -- UI-проверка текущей цели (на случай, если раунд уже начался до этого момента)
+    local targetLabel = FindTargetLabel()
+    local function CheckFromUi()
+        if not isChainRunning or IsTerminated then return end
+        if not targetLabel or not IsTargetVisible(targetLabel) then return end
+
+        local raw = targetLabel.Text
+        local clean = CleanNickname(raw)
+        if clean == "" or clean == "Label" or clean == "None" then return end
+
+        local plr = FindPlayerByName(clean)
+        if plr then
+            activeTargetPlayer = plr
+            activeTargetName = plr.Name
+            TryEliminateTarget(plr, raw)
+        end
+    end
+
+    if targetLabel then
+        uiTextConn = targetLabel:GetPropertyChangedSignal("Text"):Connect(function()
+            CheckFromUi()
+        end)
+    end
+
+    CheckFromUi()
+
+    -- Watchdog-цикл добивания и контроля живых участников
+    local noTargetStreak = 0
+    local startTime = tick()
+
+    while isChainRunning and not IsTerminated and SETTINGS.AutoFarmEnabled and CurrentState == State.Action and not BagIsFull and SETTINGS.RoundMode == "Assassin" do
+        task.wait(0.05)
+
+        -- Проверка нашего персонажа и раунда
+        local myChar = LocalPlayer.Character
+        local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+        if not myChar or not myHum or myHum.Health <= 0 then break end
+        if not RoundInProgress() or not rt:CheckIfPlayerWasInARound() then break end
+
+        -- Проверка количества живых игроков
+        local aliveCount = CountAliveRoundPlayers()
+        if aliveCount <= 2 then
+            UpdateStatus("Зачистка: Осталось " .. aliveCount .. " участников. Завершено.", Color3.fromRGB(100, 255, 120))
+            break
+        end
+
+        -- Авто-добивание цели, если она ещё не погибла
+        if activeTargetPlayer and activeTargetPlayer.Character then
+            local tHum = activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if tHum and tHum.Health > 0 then
+                if SETTINGS.GameMode == "Twin" and IsTwinPlayer(activeTargetPlayer, activeTargetName) then
+                    UpdateStatus("Зачистка: Цель — Твинк. Стоп.", Color3.fromRGB(100, 255, 120))
+                    break
+                end
+
+                if aliveCount <= 2 then break end
+
+                knife = InspectAndEquipKnife() or knife
+                TurboKill(activeTargetPlayer, knife)
+            end
+        end
+
+        -- Проверка UI если сетевой цели нет
+        local currentLbl = FindTargetLabel()
+        local isVis = IsTargetVisible(currentLbl)
+        local raw = currentLbl and currentLbl.Text or ""
+        local clean = CleanNickname(raw)
+        local hasTarget = isVis and clean ~= "" and clean ~= "Label" and clean ~= "None"
+
+        if hasTarget then
+            noTargetStreak = 0
+            if not activeTargetPlayer or not activeTargetPlayer.Character or (activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid") and activeTargetPlayer.Character:FindFirstChildOfClass("Humanoid").Health <= 0) then
+                local plr = FindPlayerByName(clean)
+                if plr and plr ~= activeTargetPlayer then
+                    activeTargetPlayer = plr
+                    activeTargetName = plr.Name
+                    TryEliminateTarget(plr, raw)
+                end
+            end
+        else
+            noTargetStreak = noTargetStreak + 1
+            if noTargetStreak >= 20 then
+                -- Окно таргетов скрыто более 1 секунды
+                UpdateStatus("Зачистка: Таргеты отсутствуют", Color3.fromRGB(150, 200, 255))
+                break
+            end
+        end
+
+        -- Защитный тайм-аут зачистки (не более 12 секунд)
+        if tick() - startTime > 12 then
+            UpdateStatus("Зачистка: Тайм-аут. Переход к фарму.", Color3.fromRGB(200, 200, 100))
+            break
+        end
+    end
+
+    -- Отключение слушателей зачистки
+    if netTargetConn then netTargetConn:Disconnect() end
+    if netEndConn then netEndConn:Disconnect() end
+    if uiTextConn then uiTextConn:Disconnect() end
+
+    -- Прячем нож в инвентарь перед началом сбора монет
+    UnequipKnife()
+    task.wait(0.15)
+end
+
+-- =====================================================================
+-- ДОБИВАНИЕ ОСТАВШЕЙСЯ ЦЕЛИ ПРИ ПОЛНОЙ СУМКЕ (KILL ALL)
+-- =====================================================================
+local function KillFinalTarget()
+    UpdateStatus("Сумка полна: Добивание финальной цели...", Color3.fromRGB(255, 80, 80))
+    local knife = InspectAndEquipKnife()
+    if not knife then
+        UpdateStatus("Kill All: Нож не найден в инвентаре!", Color3.fromRGB(255, 100, 100))
+        return
+    end
+
+    local killStart = tick()
+    while tick() - killStart < 4 and not IsTerminated and RoundInProgress() do
+        local target = RunTargetScan() or FindRemainingAlivePlayer()
+        if not target then break end
+
+        local tChar = target.Character
+        local tHum = tChar and tChar:FindFirstChildOfClass("Humanoid")
+        if not tHum or tHum.Health <= 0 then break end
+
+        knife = InspectAndEquipKnife() or knife
+        TurboKill(target, knife)
+        task.wait(0.05)
+    end
+
+    UnequipKnife()
+    UpdateStatus("Kill All: Раунд выигран! Победа.", Color3.fromRGB(100, 255, 120))
+end
+
+-- =====================================================================
+-- ИНТЕРФЕЙС GUI
+-- =====================================================================
+local function GetSafeGuiParent()
+    local success, result = pcall(function() return gethui() end)
+    if success and result then return result end
+    local coreSuccess, coreResult = pcall(function() return game:GetService("CoreGui") end)
+    if coreSuccess and coreResult then return coreResult end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "MM2_AIO_Gui"
+ScreenGui.Parent = GetSafeGuiParent()
+ScreenGui.ResetOnSpawn = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+
+-- Масштаб интерфейса (0.5 = уменьшен в 2 раза)
+local UI_SCALE = 0.5
+
+local MainFrame = Instance.new("Frame", ScreenGui)
+MainFrame.Name = "MainFrame"
+MainFrame.Size = UDim2.new(0, 320, 0, 360)
+MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+MainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = false
+MainFrame.Active = true
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+
+local MainScale = Instance.new("UIScale", MainFrame)
+MainScale.Scale = UI_SCALE
+
+local TitleBar = Instance.new("Frame", MainFrame)
+TitleBar.Name = "TitleBar"
+TitleBar.Size = UDim2.new(1, 0, 0, 35)
+TitleBar.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+TitleBar.BorderSizePixel = 0
+TitleBar.Active = true
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+
+local TitleFix = Instance.new("Frame", TitleBar)
+TitleFix.Size = UDim2.new(1, 0, 0.5, 0)
+TitleFix.Position = UDim2.new(0, 0, 0.5, 0)
+TitleFix.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+TitleFix.BorderSizePixel = 0
+
+local TitleLabel = Instance.new("TextLabel", TitleBar)
+TitleLabel.Size = UDim2.new(1, -70, 1, 0)
+TitleLabel.Position = UDim2.new(0, 12, 0, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "MM2 AIO SCRIPT [TURBO]"
+TitleLabel.TextColor3 = Color3.new(1, 1, 1)
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 14
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local TPBtn = Instance.new("TextButton", TitleBar)
+TPBtn.Name = "TPBtn"
+TPBtn.Size = UDim2.new(0, 26, 0, 26)
+TPBtn.Position = UDim2.new(1, -60, 0.5, -13)
+TPBtn.BackgroundColor3 = isInitialRejoinPanel and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(50, 50, 65)
+TPBtn.Text = "⇄"
+TPBtn.TextColor3 = Color3.new(1, 1, 1)
+TPBtn.Font = Enum.Font.GothamBold
+TPBtn.TextSize = 14
+TPBtn.Active = true
+TPBtn.ZIndex = 15
+Instance.new("UICorner", TPBtn).CornerRadius = UDim.new(0, 6)
+
+local CloseBtn = Instance.new("TextButton", TitleBar)
+CloseBtn.Name = "CloseBtn"
+CloseBtn.Size = UDim2.new(0, 26, 0, 26)
+CloseBtn.Position = UDim2.new(1, -30, 0.5, -13)
+CloseBtn.BackgroundColor3 = Color3.fromRGB(215, 45, 45)
+CloseBtn.Text = "✕"
+CloseBtn.TextColor3 = Color3.new(1, 1, 1)
+CloseBtn.Font = Enum.Font.GothamBold
+CloseBtn.TextSize = 14
+CloseBtn.Active = true
+CloseBtn.ZIndex = 15
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0, 6)
+
+CloseBtn.MouseEnter:Connect(function()
+    CloseBtn.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+end)
+CloseBtn.MouseLeave:Connect(function()
+    CloseBtn.BackgroundColor3 = Color3.fromRGB(215, 45, 45)
+end)
+
+-- Перетаскивание окна
+local dragging, dragInput, dragStart, startPos
+RegisterConnection(TitleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = MainFrame.Position
+        local endConn
+        endConn = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+                if endConn then endConn:Disconnect() end
+            end
+        end)
+    end
+end))
+
+RegisterConnection(TitleBar.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        dragInput = input
+    end
+end))
+
+RegisterConnection(RunService.RenderStepped:Connect(function()
+    if dragging and dragInput and not IsTerminated then
+        local delta = dragInput.Position - dragStart
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end))
+
+-- === ДОЧЕРНЯЯ ПАНЕЛЬ АВТОРЕКОННЕКТА ===
+local RejoinPanel = Instance.new("Frame", MainFrame)
+RejoinPanel.Name = "RejoinPanel"
+RejoinPanel.Size = UDim2.new(0, 210, 1, 0)
+RejoinPanel.Position = UDim2.new(1, 8, 0, 0)
+RejoinPanel.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+RejoinPanel.BorderSizePixel = 0
+RejoinPanel.Active = true
+RejoinPanel.Visible = isInitialRejoinPanel
+Instance.new("UICorner", RejoinPanel).CornerRadius = UDim.new(0, 10)
+
+local RejoinTitleBar = Instance.new("Frame", RejoinPanel)
+RejoinTitleBar.Name = "RejoinTitleBar"
+RejoinTitleBar.Size = UDim2.new(1, 0, 0, 35)
+RejoinTitleBar.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+RejoinTitleBar.BorderSizePixel = 0
+Instance.new("UICorner", RejoinTitleBar).CornerRadius = UDim.new(0, 10)
+
+local RejoinTitleFix = Instance.new("Frame", RejoinTitleBar)
+RejoinTitleFix.Size = UDim2.new(1, 0, 0.5, 0)
+RejoinTitleFix.Position = UDim2.new(0, 0, 0.5, 0)
+RejoinTitleFix.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+RejoinTitleFix.BorderSizePixel = 0
+
+local RejoinTitleLabel = Instance.new("TextLabel", RejoinTitleBar)
+RejoinTitleLabel.Size = UDim2.new(1, 0, 1, 0)
+RejoinTitleLabel.BackgroundTransparency = 1
+RejoinTitleLabel.Text = "АВТОРЕКОННЕКТ"
+RejoinTitleLabel.TextColor3 = Color3.new(1, 1, 1)
+RejoinTitleLabel.Font = Enum.Font.GothamBold
+RejoinTitleLabel.TextSize = 13
+RejoinTitleLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+-- Карточка статуса / обратного отсчета
+local RejoinCountdownCard = Instance.new("Frame", RejoinPanel)
+RejoinCountdownCard.Name = "RejoinCountdownCard"
+RejoinCountdownCard.Size = UDim2.new(1, -16, 0, 48)
+RejoinCountdownCard.Position = UDim2.new(0, 8, 0, 43)
+RejoinCountdownCard.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+RejoinCountdownCard.BorderSizePixel = 0
+Instance.new("UICorner", RejoinCountdownCard).CornerRadius = UDim.new(0, 6)
+
+local RejoinStatusHeader = Instance.new("TextLabel", RejoinCountdownCard)
+RejoinStatusHeader.Size = UDim2.new(1, -10, 0, 16)
+RejoinStatusHeader.Position = UDim2.new(0, 5, 0, 4)
+RejoinStatusHeader.BackgroundTransparency = 1
+RejoinStatusHeader.Text = "ТАЙМЕР СЕССИИ"
+RejoinStatusHeader.TextColor3 = Color3.fromRGB(150, 150, 170)
+RejoinStatusHeader.Font = Enum.Font.GothamBold
+RejoinStatusHeader.TextSize = 10
+RejoinStatusHeader.TextXAlignment = Enum.TextXAlignment.Center
+
+local RejoinCountdownLabel = Instance.new("TextLabel", RejoinCountdownCard)
+RejoinCountdownLabel.Name = "RejoinCountdownLabel"
+RejoinCountdownLabel.Size = UDim2.new(1, -10, 0, 22)
+RejoinCountdownLabel.Position = UDim2.new(0, 5, 0, 20)
+RejoinCountdownLabel.BackgroundTransparency = 1
+RejoinCountdownLabel.Text = SETTINGS.AutoRejoinEnabled and "Инициализация..." or "Статус: ВЫКЛЮЧЕН"
+RejoinCountdownLabel.TextColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(150, 220, 255) or Color3.fromRGB(180, 180, 190)
+RejoinCountdownLabel.Font = Enum.Font.GothamBold
+RejoinCountdownLabel.TextSize = 11
+RejoinCountdownLabel.TextXAlignment = Enum.TextXAlignment.Center
+RejoinCountdownLabel.TextWrapped = true
+
+-- Кнопка переключения автореконнекта (ON / OFF)
+local BtnRejoinToggle = Instance.new("TextButton", RejoinPanel)
+BtnRejoinToggle.Name = "BtnRejoinToggle"
+BtnRejoinToggle.Size = UDim2.new(1, -16, 0, 30)
+BtnRejoinToggle.Position = UDim2.new(0, 8, 0, 98)
+BtnRejoinToggle.BackgroundColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
+BtnRejoinToggle.Text = "РЕКОННЕКТ: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
+BtnRejoinToggle.TextColor3 = Color3.new(1, 1, 1)
+BtnRejoinToggle.Font = Enum.Font.GothamBold
+BtnRejoinToggle.TextSize = 12
+BtnRejoinToggle.Active = true
+BtnRejoinToggle.ZIndex = 10
+Instance.new("UICorner", BtnRejoinToggle).CornerRadius = UDim.new(0, 6)
+
+-- Кнопка выбора типа сервера (Текущий / Случайный)
+local BtnServerMode = Instance.new("TextButton", RejoinPanel)
+BtnServerMode.Name = "BtnServerMode"
+BtnServerMode.Size = UDim2.new(1, -16, 0, 30)
+BtnServerMode.Position = UDim2.new(0, 8, 0, 134)
+BtnServerMode.BackgroundColor3 = SETTINGS.RejoinServerMode == "Same" and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(140, 50, 200)
+BtnServerMode.Text = "СЕРВЕР: " .. (SETTINGS.RejoinServerMode == "Same" and "ТЕКУЩИЙ" or "СЛУЧАЙНЫЙ")
+BtnServerMode.TextColor3 = Color3.new(1, 1, 1)
+BtnServerMode.Font = Enum.Font.GothamBold
+BtnServerMode.TextSize = 11
+BtnServerMode.Active = true
+BtnServerMode.ZIndex = 10
+Instance.new("UICorner", BtnServerMode).CornerRadius = UDim.new(0, 6)
+
+-- Карточка ввода интервала
+local RejoinInputCard = Instance.new("Frame", RejoinPanel)
+RejoinInputCard.Name = "RejoinInputCard"
+RejoinInputCard.Size = UDim2.new(1, -16, 0, 56)
+RejoinInputCard.Position = UDim2.new(0, 8, 0, 170)
+RejoinInputCard.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+RejoinInputCard.BorderSizePixel = 0
+Instance.new("UICorner", RejoinInputCard).CornerRadius = UDim.new(0, 6)
+
+local RejoinInputLabel = Instance.new("TextLabel", RejoinInputCard)
+RejoinInputLabel.Size = UDim2.new(1, -10, 0, 18)
+RejoinInputLabel.Position = UDim2.new(0, 5, 0, 4)
+RejoinInputLabel.BackgroundTransparency = 1
+RejoinInputLabel.Text = "Интервал таймера (сек):"
+RejoinInputLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+RejoinInputLabel.Font = Enum.Font.GothamBold
+RejoinInputLabel.TextSize = 10
+RejoinInputLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local RejoinTimeInput = Instance.new("TextBox", RejoinInputCard)
+RejoinTimeInput.Name = "RejoinTimeInput"
+RejoinTimeInput.Size = UDim2.new(1, -10, 0, 26)
+RejoinTimeInput.Position = UDim2.new(0, 5, 0, 24)
+RejoinTimeInput.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+RejoinTimeInput.BorderSizePixel = 0
+RejoinTimeInput.Text = tostring(SETTINGS.RejoinTime)
+RejoinTimeInput.TextColor3 = Color3.new(1, 1, 1)
+RejoinTimeInput.Font = Enum.Font.GothamBold
+RejoinTimeInput.TextSize = 12
+RejoinTimeInput.ClearTextOnFocus = false
+Instance.new("UICorner", RejoinTimeInput).CornerRadius = UDim.new(0, 4)
+
+-- Кнопка ручного перезахода прямо сейчас
+local BtnManualRejoin = Instance.new("TextButton", RejoinPanel)
+BtnManualRejoin.Name = "BtnManualRejoin"
+BtnManualRejoin.Size = UDim2.new(1, -16, 0, 28)
+BtnManualRejoin.Position = UDim2.new(0, 8, 0, 232)
+BtnManualRejoin.BackgroundColor3 = Color3.fromRGB(220, 130, 20)
+BtnManualRejoin.Text = "⚡ ПЕРЕЗАЙТИ СЕЙЧАС"
+BtnManualRejoin.TextColor3 = Color3.new(1, 1, 1)
+BtnManualRejoin.Font = Enum.Font.GothamBold
+BtnManualRejoin.TextSize = 11
+BtnManualRejoin.Active = true
+BtnManualRejoin.ZIndex = 10
+Instance.new("UICorner", BtnManualRejoin).CornerRadius = UDim.new(0, 6)
+
+-- Кнопка сохранения настроек реконнекта в профиль
+local SaveRejoinBtn = Instance.new("TextButton", RejoinPanel)
+SaveRejoinBtn.Name = "SaveRejoinBtn"
+SaveRejoinBtn.Size = UDim2.new(1, -16, 0, 28)
+SaveRejoinBtn.Position = UDim2.new(0, 8, 0, 266)
+SaveRejoinBtn.BackgroundColor3 = Color3.fromRGB(35, 130, 70)
+SaveRejoinBtn.Text = "💾 СОХРАНИТЬ В ПРОФИЛЬ"
+SaveRejoinBtn.TextColor3 = Color3.new(1, 1, 1)
+SaveRejoinBtn.Font = Enum.Font.GothamBold
+SaveRejoinBtn.TextSize = 11
+SaveRejoinBtn.Active = true
+SaveRejoinBtn.ZIndex = 10
+Instance.new("UICorner", SaveRejoinBtn).CornerRadius = UDim.new(0, 6)
+
+-- Кнопка сохранения профиля по умолчанию (над кнопками СТАТИСТИКА, ФАРМ, ГОЛОС)
+local SaveProfileBtn = Instance.new("TextButton", MainFrame)
+SaveProfileBtn.Name = "SaveProfileBtn"
+SaveProfileBtn.Size = UDim2.new(1, -16, 0, 26)
+SaveProfileBtn.Position = UDim2.new(0, 8, 0, 40)
+SaveProfileBtn.BackgroundColor3 = Color3.fromRGB(35, 130, 70)
+SaveProfileBtn.Text = "💾 СОХРАНИТЬ ПРОФИЛЬ"
+SaveProfileBtn.TextColor3 = Color3.new(1, 1, 1)
+SaveProfileBtn.Font = Enum.Font.GothamBold
+SaveProfileBtn.TextSize = 12
+SaveProfileBtn.Active = true
+SaveProfileBtn.ZIndex = 10
+Instance.new("UICorner", SaveProfileBtn).CornerRadius = UDim.new(0, 6)
+
+SaveProfileBtn.MouseEnter:Connect(function()
+    SaveProfileBtn.BackgroundColor3 = Color3.fromRGB(45, 160, 85)
+end)
+SaveProfileBtn.MouseLeave:Connect(function()
+    SaveProfileBtn.BackgroundColor3 = Color3.fromRGB(35, 130, 70)
+end)
+
+-- Верхнее меню (Кнопки режимов)
+local TopMenu = Instance.new("Frame", MainFrame)
+TopMenu.Size = UDim2.new(1, -16, 0, 32)
+TopMenu.Position = UDim2.new(0, 8, 0, 70)
+TopMenu.BackgroundTransparency = 1
+
+local TopMenuLayout = Instance.new("UIListLayout", TopMenu)
+TopMenuLayout.FillDirection = Enum.FillDirection.Horizontal
+TopMenuLayout.SortOrder = Enum.SortOrder.LayoutOrder
+TopMenuLayout.Padding = UDim.new(0, 5)
+
+local function CreateTopButton(text, color, parent)
+    local btn = Instance.new("TextButton", parent)
+    btn.Size = UDim2.new(0.333, -4, 1, 0)
+    btn.BackgroundColor3 = color
+    btn.Text = text
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.Active = true
+    btn.ZIndex = 10
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    return btn
+end
+
+local isInitialStats = (initialProfile and initialProfile.StatsPanelVisible == true) or false
+
+local BtnStats = CreateTopButton("СТАТИСТИКА", isInitialStats and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(60, 60, 70), TopMenu)
+local BtnFarm = CreateTopButton(SETTINGS.AutoFarmEnabled and "ФАРМ: ON" or "ФАРМ: OFF", SETTINGS.AutoFarmEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50), TopMenu)
+local BtnVote = CreateTopButton(SETTINGS.AutoVoteEnabled and "ГОЛОС: ON" or "ГОЛОС: OFF", SETTINGS.AutoVoteEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50), TopMenu)
+
+-- Панель статистики
+local StatsPanel = Instance.new("Frame", MainFrame)
+StatsPanel.Size = UDim2.new(1, -16, 0, 65)
+StatsPanel.Position = UDim2.new(0, 8, 0, 107)
+StatsPanel.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+StatsPanel.Visible = isInitialStats
+Instance.new("UICorner", StatsPanel).CornerRadius = UDim.new(0, 6)
+
+local StatsText = Instance.new("TextLabel", StatsPanel)
+StatsText.Size = UDim2.new(1, -10, 1, -10)
+StatsText.Position = UDim2.new(0, 5, 0, 5)
+StatsText.BackgroundTransparency = 1
+StatsText.Text = "Время: 00:00:00 | В сумке: 0\nМонет собрано: 0\nМонет в час: 0"
+StatsText.TextColor3 = Color3.fromRGB(220, 220, 220)
+StatsText.Font = Enum.Font.Gotham
+StatsText.TextSize = 13
+StatsText.TextXAlignment = Enum.TextXAlignment.Left
+StatsText.TextYAlignment = Enum.TextYAlignment.Top
+
+-- Контейнер настроек
+local SettingsContainer = Instance.new("Frame", MainFrame)
+SettingsContainer.Size = UDim2.new(1, -16, 0, 245)
+SettingsContainer.Position = UDim2.new(0, 8, 0, isInitialStats and 177 or 107)
+SettingsContainer.BackgroundTransparency = 1
+
+local SettingsLayout = Instance.new("UIListLayout", SettingsContainer)
+SettingsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+SettingsLayout.Padding = UDim.new(0, 5)
+
+-- Универсальное ограничение FPS
+local function setTargetFps(fps: number): boolean
+    local fn = setfpscap or (getgenv and getgenv().setfpscap) or set_fps_cap or (getgenv and getgenv().set_fps_cap)
+    if typeof(fn) == "function" then
+        local ok = pcall(fn, fps)
+        return ok
+    end
+    return false
+end
+
+local function CreateControlRow(parent, labelText, defaultVal, minVal, maxVal, step, callback)
+    local Row = Instance.new("Frame", parent)
+    Row.Size = UDim2.new(1, 0, 0, 38)
+    Row.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+    Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
+
+    local Label = Instance.new("TextLabel", Row)
+    Label.Size = UDim2.new(0.6, 0, 1, 0)
+    Label.Position = UDim2.new(0, 10, 0, 0)
+    Label.BackgroundTransparency = 1
+    Label.Text = labelText .. ": " .. defaultVal
+    Label.TextColor3 = Color3.new(1, 1, 1)
+    Label.Font = Enum.Font.GothamSemibold
+    Label.TextSize = 13
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+
+    local BtnMinus = Instance.new("TextButton", Row)
+    BtnMinus.Size = UDim2.new(0, 30, 0, 28)
+    BtnMinus.Position = UDim2.new(1, -70, 0.5, -14)
+    BtnMinus.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    BtnMinus.Text = "-"
+    BtnMinus.TextColor3 = Color3.new(1, 1, 1)
+    BtnMinus.Font = Enum.Font.GothamBold
+    BtnMinus.TextSize = 16
+    BtnMinus.Active = true
+    BtnMinus.ZIndex = 10
+    Instance.new("UICorner", BtnMinus).CornerRadius = UDim.new(0, 6)
+
+    local BtnPlus = Instance.new("TextButton", Row)
+    BtnPlus.Size = UDim2.new(0, 30, 0, 28)
+    BtnPlus.Position = UDim2.new(1, -35, 0.5, -14)
+    BtnPlus.BackgroundColor3 = Color3.fromRGB(50, 200, 50)
+    BtnPlus.Text = "+"
+    BtnPlus.TextColor3 = Color3.new(1, 1, 1)
+    BtnPlus.Font = Enum.Font.GothamBold
+    BtnPlus.TextSize = 16
+    BtnPlus.Active = true
+    BtnPlus.ZIndex = 10
+    Instance.new("UICorner", BtnPlus).CornerRadius = UDim.new(0, 6)
+
+    local currentValue = defaultVal
+
+    BindClick(BtnMinus, function()
+        currentValue = math.max(minVal, currentValue - step)
+        Label.Text = labelText .. ": " .. currentValue
+        callback(currentValue)
+    end)
+
+    BindClick(BtnPlus, function()
+        currentValue = math.min(maxVal, currentValue + step)
+        Label.Text = labelText .. ": " .. currentValue
+        callback(currentValue)
+    end)
+end
+
+CreateControlRow(SettingsContainer, "СКОРОСТЬ", SETTINGS.Speed, 10, 100, 1, function(val) SETTINGS.Speed = val end)
+CreateControlRow(SettingsContainer, "FPS CAP", SETTINGS.FpsCap, 6, 60, 2, function(val)
+    SETTINGS.FpsCap = val
+    if SETTINGS.PotatoMode then setTargetFps(val) end
+end)
+
+local PotatoBtn = Instance.new("TextButton", SettingsContainer)
+PotatoBtn.Size = UDim2.new(1, 0, 0, 35)
+PotatoBtn.BackgroundColor3 = SETTINGS.PotatoMode and Color3.fromRGB(200, 150, 50) or Color3.fromRGB(60, 60, 70)
+PotatoBtn.Text = "POTATO MODE: " .. (SETTINGS.PotatoMode and "ON" or "OFF")
+PotatoBtn.TextColor3 = Color3.new(1, 1, 1)
+PotatoBtn.Font = Enum.Font.GothamSemibold
+PotatoBtn.TextSize = 13
+PotatoBtn.Active = true
+PotatoBtn.ZIndex = 10
+Instance.new("UICorner", PotatoBtn).CornerRadius = UDim.new(0, 6)
+
+-- Контейнер для двух кнопок в одну линию: СУМКА и РЕЖИМ (СОЛО / ТВИНК)
+local DualRow = Instance.new("Frame", SettingsContainer)
+DualRow.Name = "DualRow"
+DualRow.Size = UDim2.new(1, 0, 0, 35)
+DualRow.BackgroundTransparency = 1
+
+-- Кнопка действия при полной сумке: РЕСЕТ / KILL ALL / AFK
+local BagModeBtn = Instance.new("TextButton", DualRow)
+BagModeBtn.Name = "BagModeBtn"
+BagModeBtn.Size = UDim2.new(0.5, -3, 1, 0)
+BagModeBtn.Position = UDim2.new(0, 0, 0, 0)
+if SETTINGS.BagFullMode == "KillAll" then
+    BagModeBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+    BagModeBtn.Text = "СУМКА: KILL ALL"
+elseif SETTINGS.BagFullMode == "AFK" then
+    BagModeBtn.BackgroundColor3 = Color3.fromRGB(140, 90, 210)
+    BagModeBtn.Text = "СУМКА: AFK"
+else
+    BagModeBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+    BagModeBtn.Text = "СУМКА: РЕСЕТ"
+end
+BagModeBtn.TextColor3 = Color3.new(1, 1, 1)
+BagModeBtn.Font = Enum.Font.GothamSemibold
+BagModeBtn.TextSize = 12
+BagModeBtn.Active = true
+BagModeBtn.ZIndex = 10
+Instance.new("UICorner", BagModeBtn).CornerRadius = UDim.new(0, 6)
+
+-- Кнопка переключения режима зачистки: С ТВИНКОМ / СОЛО
+local GameModeBtn = Instance.new("TextButton", DualRow)
+GameModeBtn.Name = "GameModeBtn"
+GameModeBtn.Size = UDim2.new(0.5, -3, 1, 0)
+GameModeBtn.Position = UDim2.new(0.5, 3, 0, 0)
+GameModeBtn.BackgroundColor3 = (SETTINGS.GameMode == "Twin") and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(60, 60, 70)
+GameModeBtn.Text = (SETTINGS.GameMode == "Twin") and "РЕЖИМ: С ТВИНКОМ" or "РЕЖИМ: СОЛО"
+GameModeBtn.TextColor3 = Color3.new(1, 1, 1)
+GameModeBtn.Font = Enum.Font.GothamSemibold
+GameModeBtn.TextSize = 12
+GameModeBtn.Active = true
+GameModeBtn.ZIndex = 10
+Instance.new("UICorner", GameModeBtn).CornerRadius = UDim.new(0, 6)
+
+-- Кнопка переключения режима игры: ASSASSIN / CLASSIC
+local RoundModeBtn = Instance.new("TextButton", SettingsContainer)
+RoundModeBtn.Name = "RoundModeBtn"
+RoundModeBtn.Size = UDim2.new(1, 0, 0, 35)
+RoundModeBtn.BackgroundColor3 = (SETTINGS.RoundMode == "Assassin") and Color3.fromRGB(150, 40, 180) or Color3.fromRGB(45, 125, 245)
+RoundModeBtn.Text = (SETTINGS.RoundMode == "Assassin") and "РЕЖИМ: ASSASSIN" or "РЕЖИМ: CLASSIC"
+RoundModeBtn.TextColor3 = Color3.new(1, 1, 1)
+RoundModeBtn.Font = Enum.Font.GothamSemibold
+RoundModeBtn.TextSize = 13
+RoundModeBtn.Active = true
+RoundModeBtn.ZIndex = 10
+Instance.new("UICorner", RoundModeBtn).CornerRadius = UDim.new(0, 6)
+
+-- Контейнер ввода ника твинка + кнопка сохранения
+local TwinContainer = Instance.new("Frame", SettingsContainer)
+TwinContainer.Name = "TwinContainer"
+TwinContainer.Size = UDim2.new(1, 0, 0, 35)
+TwinContainer.BackgroundTransparency = 1
+TwinContainer.Visible = (SETTINGS.GameMode == "Twin")
+
+local TwinTextBox = Instance.new("TextBox", TwinContainer)
+TwinTextBox.Name = "TwinTextBox"
+TwinTextBox.Size = UDim2.new(0.72, -4, 1, 0)
+TwinTextBox.Position = UDim2.new(0, 0, 0, 0)
+TwinTextBox.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+TwinTextBox.PlaceholderText = "Ник твинка..."
+TwinTextBox.PlaceholderColor3 = Color3.fromRGB(130, 130, 140)
+TwinTextBox.Text = SETTINGS.TwinName or ""
+TwinTextBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+TwinTextBox.Font = Enum.Font.GothamSemibold
+TwinTextBox.TextSize = 12
+TwinTextBox.ClearTextOnFocus = false
+Instance.new("UICorner", TwinTextBox).CornerRadius = UDim.new(0, 6)
+
+local SaveTwinBtn = Instance.new("TextButton", TwinContainer)
+SaveTwinBtn.Name = "SaveTwinBtn"
+SaveTwinBtn.Size = UDim2.new(0.28, 0, 1, 0)
+SaveTwinBtn.Position = UDim2.new(0.72, 0, 0, 0)
+SaveTwinBtn.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+SaveTwinBtn.Text = "💾 СОХР"
+SaveTwinBtn.TextColor3 = Color3.new(1, 1, 1)
+SaveTwinBtn.Font = Enum.Font.GothamBold
+SaveTwinBtn.TextSize = 11
+SaveTwinBtn.Active = true
+SaveTwinBtn.ZIndex = 10
+Instance.new("UICorner", SaveTwinBtn).CornerRadius = UDim.new(0, 6)
+
+-- Кнопка спама голосования (до 11 раз через сброс, появляется при включении автоголосования)
+local VoteSpamBtn = Instance.new("TextButton", SettingsContainer)
+VoteSpamBtn.Name = "VoteSpamBtn"
+VoteSpamBtn.Size = UDim2.new(1, 0, 0, 35)
+VoteSpamBtn.BackgroundColor3 = SETTINGS.VoteSpamEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(60, 60, 70)
+VoteSpamBtn.Text = "СПАМ ГОЛОСА: " .. (SETTINGS.VoteSpamEnabled and "ON" or "OFF")
+VoteSpamBtn.TextColor3 = Color3.new(1, 1, 1)
+VoteSpamBtn.Font = Enum.Font.GothamSemibold
+VoteSpamBtn.TextSize = 13
+VoteSpamBtn.Active = true
+VoteSpamBtn.ZIndex = 10
+VoteSpamBtn.Visible = (SETTINGS.AutoVoteEnabled == true)
+Instance.new("UICorner", VoteSpamBtn).CornerRadius = UDim.new(0, 6)
+
+-- Подвал: строка состояния
+local StatusFrame = Instance.new("Frame", MainFrame)
+StatusFrame.Size = UDim2.new(1, 0, 0, 25)
+StatusFrame.Position = UDim2.new(0, 0, 1, -25)
+StatusFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+StatusFrame.BorderSizePixel = 0
+
+local StatusLabel = Instance.new("TextLabel", StatusFrame)
+StatusLabel.Size = UDim2.new(1, -10, 1, 0)
+StatusLabel.Position = UDim2.new(0, 5, 0, 0)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Text = "Ожидание команд..."
+StatusLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.TextSize = 12
+StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+UpdateStatus = function(text, color)
+    if IsTerminated then return end
+    StatusLabel.Text = "> " .. text
+    StatusLabel.TextColor3 = color or Color3.fromRGB(200, 200, 200)
+end
+
+-- Динамическое обновление размеров GUI
+local function UpdateGuiSizes()
+    local isStats = StatsPanel.Visible
+    local isTwin = (SETTINGS.GameMode == "Twin")
+    local isVote = (SETTINGS.AutoVoteEnabled == true)
+
+    TwinContainer.Visible = isTwin
+    VoteSpamBtn.Visible = isVote
+
+    local settingsY = isStats and 177 or 107
+    local extraH = (isTwin and 40 or 0) + (isVote and 40 or 0)
+    local settingsH = 205 + extraH
+
+    SettingsContainer.Position = UDim2.new(0, 8, 0, settingsY)
+    SettingsContainer.Size = UDim2.new(1, -16, 0, settingsH)
+
+    local mainH = settingsY + settingsH + 35
+    MainFrame.Size = UDim2.new(0, 320, 0, mainH)
+end
+
+UpdateGuiSizes()
+
+-- Сохранение профиля по умолчанию в файл profile
+BindClick(SaveProfileBtn, function()
+    local ok = SaveProfile(StatsPanel.Visible, RejoinPanel and RejoinPanel.Visible)
+    if ok then
+        SaveProfileBtn.Text = "✅ ПРОФИЛЬ СОХРАНЕН!"
+        SaveProfileBtn.BackgroundColor3 = Color3.fromRGB(40, 180, 80)
+        UpdateStatus("Профиль сохранен в workspace/" .. PROFILE_FILE, Color3.fromRGB(100, 255, 100))
+        task.delay(1.5, function()
+            if not IsTerminated and SaveProfileBtn then
+                SaveProfileBtn.Text = "💾 СОХРАНИТЬ ПРОФИЛЬ"
+                SaveProfileBtn.BackgroundColor3 = Color3.fromRGB(35, 130, 70)
+            end
+        end)
+    else
+        UpdateStatus("Ошибка: executor не поддерживает writefile", Color3.fromRGB(255, 100, 100))
+    end
+end)
+
+-- Переключение спама голоса
+BindClick(VoteSpamBtn, function()
+    SETTINGS.VoteSpamEnabled = not SETTINGS.VoteSpamEnabled
+    VoteSpamBtn.Text = "СПАМ ГОЛОСА: " .. (SETTINGS.VoteSpamEnabled and "ON" or "OFF")
+    VoteSpamBtn.BackgroundColor3 = SETTINGS.VoteSpamEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(60, 60, 70)
+    if SETTINGS.VoteSpamEnabled then
+        UpdateStatus("Спам голоса: ВКЛ (до 11 раз через сброс)", Color3.fromRGB(100, 255, 100))
+    else
+        UpdateStatus("Спам голоса: ВЫКЛ (1 голос без сброса)", Color3.fromRGB(200, 200, 200))
+    end
+end)
+
+-- Сохранение ника твинка в профиль
+BindClick(SaveTwinBtn, function()
+    local name = TwinTextBox.Text or ""
+    name = string.gsub(name, "^%s*(.-)%s*$", "%1")
+    SETTINGS.TwinName = name
+    local ok = SaveProfile(StatsPanel and StatsPanel.Visible)
+    if ok then
+        UpdateStatus("Твинк сохранен в profile: " .. (name ~= "" and name or "(пусто)"), Color3.fromRGB(100, 255, 100))
+    else
+        UpdateStatus("Твинк задан (ошибка сохранения profile)", Color3.fromRGB(255, 200, 100))
+    end
+end)
+
+TwinTextBox.FocusLost:Connect(function()
+    local name = TwinTextBox.Text or ""
+    SETTINGS.TwinName = string.gsub(name, "^%s*(.-)%s*$", "%1")
+end)
+
+-- Переключение режима: С ТВИНКОМ / СОЛО
+BindClick(GameModeBtn, function()
+    if SETTINGS.GameMode == "Twin" then
+        SETTINGS.GameMode = "Solo"
+        GameModeBtn.Text = "РЕЖИМ: СОЛО"
+        GameModeBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+        UpdateStatus("Режим: Соло (оставляем 1 соперника)", Color3.fromRGB(200, 200, 255))
+    else
+        SETTINGS.GameMode = "Twin"
+        GameModeBtn.Text = "РЕЖИМ: С ТВИНКОМ"
+        GameModeBtn.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+        UpdateStatus("Режим: С Твинком (твинк: " .. (SETTINGS.TwinName ~= "" and SETTINGS.TwinName or "не задан") .. ")", Color3.fromRGB(200, 200, 255))
+    end
+    UpdateGuiSizes()
+end)
+
+-- Переключение действия при полной сумке: РЕСЕТ -> KILL ALL -> AFK -> РЕСЕТ
+BindClick(BagModeBtn, function()
+    if SETTINGS.BagFullMode == "Reset" then
+        SETTINGS.BagFullMode = "KillAll"
+        BagModeBtn.Text = "СУМКА: KILL ALL"
+        BagModeBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        UpdateStatus("Сумка полна: Kill All финальной цели", Color3.fromRGB(255, 80, 80))
+    elseif SETTINGS.BagFullMode == "KillAll" then
+        SETTINGS.BagFullMode = "AFK"
+        BagModeBtn.Text = "СУМКА: AFK"
+        BagModeBtn.BackgroundColor3 = Color3.fromRGB(140, 90, 210)
+        UpdateStatus("Сумка полна: AFK (бездействие)", Color3.fromRGB(170, 130, 255))
+    else
+        SETTINGS.BagFullMode = "Reset"
+        BagModeBtn.Text = "СУМКА: РЕСЕТ"
+        BagModeBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 70)
+        UpdateStatus("Сумка полна: Сброс персонажа", Color3.fromRGB(200, 200, 200))
+    end
+end)
+
+-- Переключение режима игры: ASSASSIN / CLASSIC
+BindClick(RoundModeBtn, function()
+    if SETTINGS.RoundMode == "Assassin" then
+        SETTINGS.RoundMode = "Classic"
+        RoundModeBtn.Text = "РЕЖИМ: CLASSIC"
+        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+        UnequipKnife()
+        UpdateStatus("Режим: Classic (зачистка отключена)", Color3.fromRGB(100, 200, 255))
+    else
+        SETTINGS.RoundMode = "Assassin"
+        RoundModeBtn.Text = "РЕЖИМ: ASSASSIN"
+        RoundModeBtn.BackgroundColor3 = Color3.fromRGB(150, 40, 180)
+        UpdateStatus("Режим: Assassin (зачистка активна)", Color3.fromRGB(220, 120, 255))
+
+        -- Если раунд уже идет прямо сейчас, мгновенно подключаем фоновую зачистку
+        if SETTINGS.AutoFarmEnabled and not IsTerminated and CurrentState == State.Action and RoundInProgress() and rt:CheckIfPlayerWasInARound() and not BagIsFull then
+            task.spawn(function()
+                PreRoundKillChain()
+            end)
+        end
+    end
+end)
+
+-- Включение / выключение панели статистики
+BindClick(BtnStats, function()
+    StatsPanel.Visible = not StatsPanel.Visible
+    BtnStats.BackgroundColor3 = StatsPanel.Visible and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(60, 60, 70)
+    UpdateGuiSizes()
+end)
+
+local function resetStats()
+    StatsData.StartTime = 0
+    StatsData.CoinsCollected = 0
+    CurrentRoundCoins = 0
+    BagCoinCount = 0
+    StatsText.Text = "Время: 00:00:00 | В сумке: 0\nМонет собрано: 0\nМонет в час: 0"
+end
+
+-- Включение / выключение автофарма
+BindClick(BtnFarm, function()
+    SETTINGS.AutoFarmEnabled = not SETTINGS.AutoFarmEnabled
+    BtnFarm.Text = "ФАРМ: " .. (SETTINGS.AutoFarmEnabled and "ON" or "OFF")
+    BtnFarm.BackgroundColor3 = SETTINGS.AutoFarmEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
+
+    local char = rt:Character()
+    local hum = char and char:FindFirstChild("Humanoid")
+
+    if not SETTINGS.AutoFarmEnabled then
+        Working = false
+        resetStats()
+        CurrentState = State.WaitingForRound
+        UnequipKnife()
+        UpdateStatus("Фарм остановлен", Color3.fromRGB(200, 100, 100))
+        if hum then hum.PlatformStand = false end
+    else
+        StatsData.StartTime = tick()
+        CurrentRoundCoins = 0
+        BagIsFull = false
+        CurrentState = State.WaitingForRound
+        UpdateStatus("Фарм запущен", Color3.fromRGB(100, 255, 100))
+        if hum then hum.PlatformStand = true end
+    end
+end)
+
+-- Включение / выключение авто-голосования
+BindClick(BtnVote, function()
+    SETTINGS.AutoVoteEnabled = not SETTINGS.AutoVoteEnabled
+    BtnVote.Text = "ГОЛОС: " .. (SETTINGS.AutoVoteEnabled and "ON" or "OFF")
+    BtnVote.BackgroundColor3 = SETTINGS.AutoVoteEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
+    if SETTINGS.AutoVoteEnabled then
+        HasVoted = false
+        UpdateStatus("Авто-голосование активно", Color3.fromRGB(100, 255, 100))
+    else
+        UpdateStatus("Авто-голосование выключено", Color3.fromRGB(200, 100, 100))
+    end
+    UpdateGuiSizes()
+end)
+
+-- Обновление статистики раз в секунду
+task.spawn(function()
+    while not IsTerminated and task.wait(1) do
+        if SETTINGS.AutoFarmEnabled and StatsData.StartTime > 0 then
+            local timeElapsed = tick() - StatsData.StartTime
+            local h = math.floor(timeElapsed / 3600)
+            local m = math.floor((timeElapsed % 3600) / 60)
+            local s = math.floor(timeElapsed % 60)
+            local hoursFloat = timeElapsed / 3600
+            local perHour = hoursFloat > 0 and math.floor(StatsData.CoinsCollected / hoursFloat) or 0
+
+            local bagInfo = (CurrentState == State.Action and ActiveCurrencyName ~= "—")
+                and string.format("%s: %d", ActiveCurrencyName, BagCoinCount)
+                or "—"
+
+            StatsText.Text = string.format("Время: %02d:%02d:%02d | В сумке: %s\nМонет собрано: %d\nМонет в час: %d", h, m, s, bagInfo, StatsData.CoinsCollected, perHour)
+        end
+    end
+end)
+
+-- === ИНТЕРАКТИВНОСТЬ И ЛОГИКА АВТОРЕКОННЕКТА ===
+BindClick(TPBtn, function()
+    RejoinPanel.Visible = not RejoinPanel.Visible
+    TPBtn.BackgroundColor3 = RejoinPanel.Visible and Color3.fromRGB(45, 125, 245) or Color3.fromRGB(50, 50, 65)
+end)
+
+BindClick(BtnRejoinToggle, function()
+    SETTINGS.AutoRejoinEnabled = not SETTINGS.AutoRejoinEnabled
+    BtnRejoinToggle.Text = "РЕКОННЕКТ: " .. (SETTINGS.AutoRejoinEnabled and "ON" or "OFF")
+    BtnRejoinToggle.BackgroundColor3 = SETTINGS.AutoRejoinEnabled and Color3.fromRGB(50, 200, 50) or Color3.fromRGB(200, 50, 50)
+    if SETTINGS.AutoRejoinEnabled then
+        RejoinStartTime = tick()
+        RejoinPending = false
+        UpdateStatus("Автореконнект активирован (" .. tostring(SETTINGS.RejoinTime) .. " с)", Color3.fromRGB(100, 255, 100))
+    else
+        RejoinPending = false
+        UpdateStatus("Автореконнект отключен", Color3.fromRGB(200, 100, 100))
+    end
+end)
+
+BindClick(BtnServerMode, function()
+    if SETTINGS.RejoinServerMode == "Same" then
+        SETTINGS.RejoinServerMode = "Random"
+        BtnServerMode.Text = "СЕРВЕР: СЛУЧАЙНЫЙ"
+        BtnServerMode.BackgroundColor3 = Color3.fromRGB(140, 50, 200)
+        UpdateStatus("Режим реконнекта: СЛУЧАЙНЫЙ сервер", Color3.fromRGB(200, 150, 255))
+    else
+        SETTINGS.RejoinServerMode = "Same"
+        BtnServerMode.Text = "СЕРВЕР: ТЕКУЩИЙ"
+        BtnServerMode.BackgroundColor3 = Color3.fromRGB(45, 125, 245)
+        UpdateStatus("Режим реконнекта: ТЕКУЩИЙ сервер (JobId)", Color3.fromRGB(150, 200, 255))
+    end
+end)
+
+RejoinTimeInput.FocusLost:Connect(function()
+    local num = tonumber(RejoinTimeInput.Text)
+    if num and num >= 5 then
+        SETTINGS.RejoinTime = math.floor(num)
+        RejoinTimeInput.Text = tostring(SETTINGS.RejoinTime)
+        RejoinStartTime = tick()
+        UpdateStatus("Интервал реконнекта: " .. tostring(SETTINGS.RejoinTime) .. " сек", Color3.fromRGB(150, 220, 255))
+    else
+        RejoinTimeInput.Text = tostring(SETTINGS.RejoinTime)
+        UpdateStatus("Неверное значение времени (минимум 5 сек)", Color3.fromRGB(255, 120, 120))
+    end
+end)
+
+BindClick(BtnManualRejoin, function()
+    UpdateStatus("Ручной перезаход запущен...", Color3.fromRGB(255, 180, 50))
+    task.defer(function()
+        DoRejoin("Ручной запуск")
+    end)
+end)
+
+BindClick(SaveRejoinBtn, function()
+    local ok = SaveProfile(StatsPanel.Visible, RejoinPanel.Visible)
+    if ok then
+        SaveRejoinBtn.Text = "✅ СОХРАНЕНО!"
+        SaveRejoinBtn.BackgroundColor3 = Color3.fromRGB(40, 180, 80)
+        UpdateStatus("Настройки сохранены в profile", Color3.fromRGB(100, 255, 100))
+        task.delay(1.5, function()
+            if not IsTerminated and SaveRejoinBtn then
+                SaveRejoinBtn.Text = "💾 СОХРАНИТЬ В ПРОФИЛЬ"
+                SaveRejoinBtn.BackgroundColor3 = Color3.fromRGB(35, 130, 70)
+            end
+        end)
+    else
+        UpdateStatus("Ошибка: executor не поддерживает writefile", Color3.fromRGB(255, 100, 100))
+    end
+end)
+
+-- Ядро выполнения реконнекта
+DoRejoin = function(reason: string?)
+    if isTeleporting or IsTerminated then return end
+    isTeleporting = true
+    
+    local targetReason = reason or "Таймер"
+    print(string.format("[AutoRejoin] Запуск реконнекта (%s)...", targetReason))
+    UpdateStatus("Реконнект (" .. targetReason .. ")...", Color3.fromRGB(255, 200, 100))
+    
+    pcall(function()
+        GuiService:ClearError()
+    end)
+    
+    local success = false
+    if SETTINGS.RejoinServerMode == "Same" and typeof(game.JobId) == "string" and game.JobId ~= "" then
+        UpdateStatus("Переход на текущий сервер (JobId)...", Color3.fromRGB(150, 200, 255))
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end)
+        if ok then
+            success = true
+        else
+            warn("[AutoRejoin] Не удалось отправить запрос на тот же сервер: " .. tostring(err))
+        end
+    end
+    
+    if not success then
+        UpdateStatus("Переход на случайный сервер...", Color3.fromRGB(150, 200, 255))
+        pcall(function()
+            TeleportService:Teleport(game.PlaceId, LocalPlayer)
+        end)
+    end
+    
+    task.delay(10, function()
+        isTeleporting = false
+    end)
+end
+
+-- Обработка сбоя телепорта (сервер выключен, полон или недоступен)
+RegisterConnection(TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+    if IsTerminated then return end
+    warn(string.format("[AutoRejoin] Ошибка инициализации телепорта: %s (%s). Запасной переход на случайный сервер...", tostring(errorMessage), tostring(teleportResult)))
+    UpdateStatus("Ошибка перехода. Перезаход на случайный...", Color3.fromRGB(255, 100, 100))
+    task.wait(2)
+    pcall(function()
+        GuiService:ClearError()
+    end)
+    pcall(function()
+        TeleportService:Teleport(game.PlaceId, LocalPlayer)
+    end)
+end))
+
+-- Отслеживание системных ошибок, дисконнектов и окон кика через GuiService
+RegisterConnection(GuiService.ErrorMessageChanged:Connect(function(msg)
+    if IsTerminated or not SETTINGS.AutoRejoinEnabled or isTeleporting then return end
+    if typeof(msg) == "string" and msg ~= "" then
+        warn("[AutoRejoin] Обнаружен дисконнект / ошибка GuiService: " .. msg)
+        UpdateStatus("Сбой сети/кик! Срочный реконнект...", Color3.fromRGB(255, 80, 80))
+        task.wait(0.5)
+        DoRejoin("Сбой сети / дисконнект")
+    end
+end))
+
+-- Цикл обратного отсчета таймера и безопасного перезахода
+task.spawn(function()
+    while not IsTerminated do
+        task.wait(1)
+        if not SETTINGS.AutoRejoinEnabled then
+            RejoinStartTime = tick()
+            RejoinPending = false
+            if RejoinCountdownLabel then
+                RejoinCountdownLabel.Text = "Статус: ВЫКЛЮЧЕН"
+                RejoinCountdownLabel.TextColor3 = Color3.fromRGB(180, 180, 190)
+            end
+            continue
+        end
+
+        local elapsed = tick() - RejoinStartTime
+        local remaining = math.max(0, math.floor(SETTINGS.RejoinTime - elapsed))
+        
+        local h = math.floor(remaining / 3600)
+        local m = math.floor((remaining % 3600) / 60)
+        local s = math.floor(remaining % 60)
+
+        if RejoinCountdownLabel then
+            if RejoinPending then
+                RejoinCountdownLabel.Text = "Ожидание лобби для перезахода..."
+                RejoinCountdownLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+            else
+                RejoinCountdownLabel.Text = string.format("До перезахода: %02d:%02d:%02d", h, m, s)
+                RejoinCountdownLabel.TextColor3 = Color3.fromRGB(150, 220, 255)
+            end
+        end
+
+        if remaining <= 0 and not isTeleporting then
+            RejoinPending = true
+            local canSafelyRejoin = (CurrentState == State.WaitingForRound) or (not rt:CheckIfGameInProgress())
+            if canSafelyRejoin then
+                DoRejoin("Плановый таймер")
+            end
+        end
+    end
+end)
+
+-- === POTATO MODE ===
+local EffectsToDestroy = {
+    ["Decal"] = true, ["Texture"] = true, ["PostEffect"] = true,
+    ["Sky"] = true, ["Atmosphere"] = true, ["SunRaysEffect"] = true,
+    ["BloomEffect"] = true, ["BlurEffect"] = true, ["ColorCorrectionEffect"] = true,
+    ["DepthOfFieldEffect"] = true, ["ParticleEmitter"] = true, ["Trail"] = true,
+    ["Fire"] = true, ["Smoke"] = true, ["Sparkles"] = true
+}
+
+local RenderingDisabled = false
+
+local function makePartPotato(v)
+    if v:IsA("BasePart") then
+        if not RenderingDisabled then
+            v.Material = Enum.Material.SmoothPlastic
+            v.Reflectance = 0
+            v.CastShadow = false
+            if v:IsA("MeshPart") then
+                v.TextureID = ""
+            end
+        end
+    elseif EffectsToDestroy[v.ClassName] then
+        v:Destroy()
+    end
+end
+
+local function applyPotatoMode()
+    if SETTINGS.PotatoMode then
+        local supported = setTargetFps(SETTINGS.FpsCap)
+        if not supported then
+            UpdateStatus("FPS Cap: не поддерживается инжектором", Color3.fromRGB(255, 120, 120))
+        end
+        pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, false) end)
+        pcall(function() RunService:Set3dRenderingEnabled(false) end)
+        RenderingDisabled = true
+
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 9e9
+        Lighting.Brightness = 1
+        pcall(function() sethiddenproperty(Lighting, "Technology", 2) end)
+
+        task.spawn(function()
+            for _, v in ipairs(Lighting:GetDescendants()) do makePartPotato(v) end
+            for _, v in ipairs(Workspace:GetDescendants()) do
+                makePartPotato(v)
+                if not SETTINGS.PotatoMode or IsTerminated then break end
+            end
+        end)
+
+        if #rt.potatoConnections == 0 then
+            table.insert(rt.potatoConnections, Workspace.ChildAdded:Connect(function(child)
+                if not SETTINGS.PotatoMode or IsTerminated then return end
+
+                -- Мелкие детали и графические эффекты обрабатываем мгновенно без создания потока
+                if child:IsA("BasePart") or EffectsToDestroy[child.ClassName] then
+                    makePartPotato(child)
+                    return
+                end
+
+                -- Для моделей и папок: отложенный обход с защитой от обработки персонажей
+                if child:IsA("Model") or child:IsA("Folder") then
+                    task.spawn(function()
+                        if Players:GetPlayerFromCharacter(child) or child:FindFirstChildOfClass("Humanoid") then
+                            return
+                        end
+                        task.wait(0.1)
+                        if not SETTINGS.PotatoMode or IsTerminated then return end
+                        if Players:GetPlayerFromCharacter(child) or child:FindFirstChildOfClass("Humanoid") then
+                            return
+                        end
+                        makePartPotato(child)
+                        for _, v in ipairs(child:GetDescendants()) do
+                            makePartPotato(v)
+                        end
+                    end)
+                end
+            end))
+
+            table.insert(rt.potatoConnections, Lighting.ChildAdded:Connect(function(child)
+                if not SETTINGS.PotatoMode or IsTerminated then return end
+                if child:IsA("BasePart") or EffectsToDestroy[child.ClassName] then
+                    makePartPotato(child)
+                    return
+                end
+                task.spawn(function()
+                    task.wait(0.1)
+                    if not SETTINGS.PotatoMode or IsTerminated then return end
+                    makePartPotato(child)
+                    for _, v in ipairs(child:GetDescendants()) do
+                        makePartPotato(v)
+                    end
+                end)
+            end))
+        end
+    else
+        setTargetFps(60)
+        pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, true) end)
+        pcall(function() RunService:Set3dRenderingEnabled(true) end)
+        RenderingDisabled = false
+
+        for _, conn in pairs(rt.potatoConnections) do
+            if conn.Connected then conn:Disconnect() end
+        end
+        table.clear(rt.potatoConnections)
+    end
+end
+
+task.spawn(function()
+    while not IsTerminated do
+        if SETTINGS.PotatoMode then
+            setTargetFps(SETTINGS.FpsCap)
+        end
+        task.wait(1.5)
+    end
+end)
+
+BindClick(PotatoBtn, function()
+    SETTINGS.PotatoMode = not SETTINGS.PotatoMode
+    PotatoBtn.Text = "POTATO MODE: " .. (SETTINGS.PotatoMode and "ON" or "OFF")
+    PotatoBtn.BackgroundColor3 = SETTINGS.PotatoMode and Color3.fromRGB(200, 150, 50) or Color3.fromRGB(60, 60, 70)
+    applyPotatoMode()
+    if not SETTINGS.PotatoMode then
+        UpdateStatus("Для возврата текстур нужно перезайти", Color3.fromRGB(200, 200, 50))
+    else
+        UpdateStatus("Potato Mode активирован", Color3.fromRGB(200, 150, 50))
+    end
+end)
+
+-- Применение начального состояния сохраненного профиля
+if initialProfile then
+    UpdateStatus("Профиль загружен (" .. PROFILE_FILE .. ")", Color3.fromRGB(100, 255, 200))
+    if SETTINGS.PotatoMode then
+        applyPotatoMode()
+    end
+    if SETTINGS.AutoFarmEnabled then
+        StatsData.StartTime = tick()
+        CurrentState = State.WaitingForRound
+        local char = rt:Character()
+        local hum = char and char:FindFirstChild("Humanoid")
+        if hum then hum.PlatformStand = true end
+    end
+end
+
+-- === ПЕРЕДВИЖЕНИЕ ДЛЯ СБОРА МОНЕТ (БЕЗОСТАНОВОЧНЫЙ ПОЛЕТ БЕЗ ЗАДЕРЖЕК) ===
+local function moveToPositionPhysically(targetPosition, targetCoin, bv, bg)
+    local char = rt:Character()
+    if not char or not char.PrimaryPart then return false end
+
+    local hrp = char.PrimaryPart
+    local underfloorOffset = SETTINGS.UnderfloorOffset or 3.8
+    local finalPosition = targetPosition - Vector3.new(0, underfloorOffset, 0)
+
+    local startPos = hrp.Position
+    local lookAtPos = Vector3.new(finalPosition.X, startPos.Y, finalPosition.Z)
+    if (lookAtPos - startPos).Magnitude > 0.1 then
+        bg.CFrame = CFrame.new(startPos, lookAtPos) * CFrame.Angles(math.rad(-90), 0, 0)
+    end
+
+    -- Реактивный слушатель удаления TouchTransmitter из монеты (ChildRemoved TT)
+    local coinRemoved = false
+    local cRemoved: RBXScriptConnection? = nil
+    if targetCoin and targetCoin.Parent then
+        cRemoved = targetCoin.ChildRemoved:Connect(function(child)
+            if child:IsA("TouchTransmitter") or child.Name == "TouchInterest" then
+                coinRemoved = true
+            end
+        end)
+    end
+
+    local flyStart = tick()
+
+    while not IsTerminated and SETTINGS.AutoFarmEnabled and char and char.PrimaryPart and CurrentState == State.Action do
+        if tick() - flyStart > 6 then break end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health <= 0 then break end
+
+        -- Если монета удалена из контейнера (Container.ChildRemoved) или удален трансмиттер — мгновенный переход
+        if coinRemoved or rt.touchedCoins[targetCoin] == "collected" then
+            if cRemoved then cRemoved:Disconnect() end
+            rt.touchedCoins[targetCoin] = "collected"
+            rt.cachedCoins[targetCoin] = nil
+            return true
+        end
+
+        local currentPos = hrp.Position
+        local distance = (finalPosition - currentPos).Magnitude
+
+        -- Зона подбора: отправляем касание и мгновенно ждем подтверждения
+        if distance < 2.0 then
+            local touchFn = firetouchtransmitter or firetouchinterest or (syn and syn.firetouchinterest)
+            local touchPart = char:FindFirstChild("Head") or hrp
+
+            if touchFn and targetCoin and targetCoin.Parent then
+                pcall(function()
+                    touchFn(touchPart, targetCoin, 0)
+                    touchFn(touchPart, targetCoin, 1)
+                    if touchPart ~= hrp then
+                        touchFn(hrp, targetCoin, 0)
+                        touchFn(hrp, targetCoin, 1)
+                    end
+                end)
+            end
+
+            -- Ожидание реактивного подтверждения (Container.ChildRemoved или targetCoin.ChildRemoved)
+            local waitStart = os.clock()
+            while not coinRemoved and rt.touchedCoins[targetCoin] ~= "collected" and (os.clock() - waitStart < 0.25) and not IsTerminated and SETTINGS.AutoFarmEnabled do
+                RunService.Heartbeat:Wait()
+            end
+
+            if cRemoved then cRemoved:Disconnect() end
+            rt.touchedCoins[targetCoin] = "collected"
+            rt.cachedCoins[targetCoin] = nil
+            return true
+        end
+
+        local direction = (finalPosition - currentPos).Unit
+        bv.Velocity = direction * SETTINGS.Speed
+
+        RunService.Heartbeat:Wait()
+    end
+
+    if cRemoved then cRemoved:Disconnect() end
+    return false
+end
+
+-- === ЛОГИКА СБОРА МОНЕТ ===
+local function CollectCoins()
+    Working = true
+    CurrentRoundCoins = 0
+    BagIsFull = false
+
+    local map = rt:Map()
+    if map then
+        if not rt.coinContainer then
+            rt.coinContainer = map:FindFirstChild("CoinContainer")
+        end
+        if rt.coinContainer then
+            PopulateCoins()
+        end
+    end
+
+    local char = rt:Character()
+    local hrp = char and char.PrimaryPart
+    local hum = char and char:FindFirstChild("Humanoid")
+
+    if not char or not hrp then return end
+    
+    updateBodyPartsCache() 
+    
+    if hum then hum.PlatformStand = true end
+
+    local bv = hrp:FindFirstChild("FarmVelocity") or Instance.new("BodyVelocity")
+    bv.Name = "FarmVelocity"
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Velocity = Vector3.zero
+    bv.Parent = hrp
+
+    local bg = hrp:FindFirstChild("FarmGyro") or Instance.new("BodyGyro")
+    bg.Name = "FarmGyro"
+    bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    bg.P = 3000
+    bg.Parent = hrp
+
+    while not IsTerminated and CurrentState == State.Action and SETTINGS.AutoFarmEnabled and not BagIsFull and rt:CheckIfPlayerWasInARound() do
+        char = rt:Character()
+        if not char or not char.PrimaryPart then break end
+
+        local targetCoin = GetNearestCoin()
+
+        if targetCoin then
+            UpdateStatus("Фарм: Лечу к монете", Color3.fromRGB(150, 255, 150))
+
+            markCoinAsPending(targetCoin)
+
+            local pickedUp = moveToPositionPhysically(targetCoin.Position, targetCoin, bv, bg)
+            if not SETTINGS.AutoFarmEnabled or IsTerminated then break end
+
+            if pickedUp and rt.touchedCoins[targetCoin] == "pending" then
+                rt.touchedCoins[targetCoin] = "collected"
+
+                if IsBagFull() then
+                    UpdateStatus("Фарм: Сохранение последней монеты...", Color3.fromRGB(255, 200, 50))
+                    bv.Velocity = Vector3.zero
+                    task.wait(0.8)
+                    break
+                end
+            end
+        else
+            if not rt.coinContainer then
+                local currentMap = rt:Map()
+                if currentMap then
+                    local foundCc = currentMap:FindFirstChild("CoinContainer")
+                    if foundCc then
+                        rt.coinContainer = foundCc
+                        PopulateCoins()
+                    end
+                end
+            elseif next(rt.cachedCoins) == nil then
+                PopulateCoins()
+            end
+            UpdateStatus("Фарм: Ожидание появления монет...", Color3.fromRGB(200, 200, 100))
+            bv.Velocity = Vector3.zero
+            task.wait(0.1)
+        end
+    end
+
+    if bv and bv.Parent then bv:Destroy() end
+    if bg and bg.Parent then bg:Destroy() end
+    if hrp then
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+    if hum then hum.PlatformStand = false end
+
+    AutoFarmCleanUp()
+end
+
+-- === ОСНОВНОЕ ДЕЙСТВИЕ В РАУНДЕ (ЗАЧИСТКА -> ФАРМ -> ОБРАБОТКА СУМКИ) ===
+local function ActionState()
+    -- 1. Предварительная зачистка (PreRoundKillChain) запускается параллельно в фоновом потоке
+    if SETTINGS.RoundMode == "Assassin" and SETTINGS.AutoFarmEnabled and not IsTerminated and RoundInProgress() and rt:CheckIfPlayerWasInARound() then
+        task.spawn(function()
+            PreRoundKillChain()
+        end)
+    end
+
+    if not SETTINGS.AutoFarmEnabled or IsTerminated then return end
+
+    -- 2. Сбор монет стартует мгновенно (как только появится CoinContainer), не теряя секунды на зачистку
+    if RoundInProgress() and rt:CheckIfPlayerWasInARound() then
+        CollectCoins()
+    end
+
+    if not SETTINGS.AutoFarmEnabled or IsTerminated then return end
+
+    -- 3. Действия при наполнении сумки или завершении раунда
+    if BagIsFull then
+        if SETTINGS.BagFullMode == "KillAll" then
+            -- Режим Kill All: достаём нож и через TurboKill добиваем оставшуюся цель, забирая победу
+            KillFinalTarget()
+            task.wait(0.5)
+            BagIsFull = false
+            ChangeState(State.WaitingForRoundEnd)
+        elseif SETTINGS.BagFullMode == "AFK" then
+            -- Режим AFK: не делаем ресет и не убиваем игроков, просто ничего не делаем и ждём окончания раунда
+            UnequipKnife()
+            UpdateStatus("Сумка полна: AFK (ожидание)", Color3.fromRGB(170, 130, 255))
+            BagIsFull = false
+            ChangeState(State.WaitingForRoundEnd)
+        else
+            -- Режим Reset: делаем сброс персонажа (BreakJoints). В живых остаётся только твинк/соперник
+            UpdateStatus("Сумка полна: Сброс персонажа", Color3.fromRGB(200, 200, 200))
+            ChangeState(State.WaitingForRoundEnd)
+            local char = rt:Character()
+            if char then
+                local hum = char:FindFirstChild("Humanoid")
+                if hum then
+                    hum.Health = 0
+                    hum:ChangeState(Enum.HumanoidStateType.Dead)
+                end
+                pcall(function() char:BreakJoints() end)
+            end
+        end
+    elseif not RoundInProgress() then
+        ChangeState(State.WaitingForRound)
+    else
+        ChangeState(State.WaitingForRoundEnd)
+    end
+end
+
+local function WaitingForRound()
+    Working = false
+    BagIsFull = false
+    UpdateStatus("Фарм: Ожидание начала раунда", Color3.fromRGB(150, 150, 150))
+
+    while not IsTerminated and SETTINGS.AutoFarmEnabled do
+        if RoundInProgress() and rt:CheckIfPlayerWasInARound() then
+            ChangeState(State.Action)
+            return
+        end
+        task.wait(0.2)
+    end
+end
+
+local function waitForRoundEnd()
+    Working = false
+    UpdateStatus("Фарм: Ожидание конца игры", Color3.fromRGB(255, 150, 50))
+    while not IsTerminated and SETTINGS.AutoFarmEnabled do
+        if not RoundInProgress() then
+            break
+        end
+        task.wait(0.5)
+    end
+
+    if not SETTINGS.AutoFarmEnabled or IsTerminated then return end
+    ChangeState(State.WaitingForRound)
+end
+
+rt.UserDied = RegisterConnection(rt.player.CharacterRemoving:Connect(function(character)
+    if IsTerminated then return end
+    AutoFarmCleanUp()
+    BagIsFull = false
+    if RoundInProgress() then
+        ChangeState(State.WaitingForRoundEnd)
+    else
+        ChangeState(State.WaitingForRound)
+    end
+end))
+
+RegisterConnection(rt.player.CharacterAdded:Connect(function(newChar)
+    if IsTerminated then return end
+    if SETTINGS.PotatoMode then
+        setTargetFps(SETTINGS.FpsCap)
+    end
+    task.wait(0.3)
+    updateBodyPartsCache()
+end))
+
+-- === АВТО-ГОЛОСОВАНИЕ ===
+local LastVoteSession = ""
+
+local function GetMapPriority(mapName)
+    local lowerMap = string.lower(mapName)
+    for i, name in ipairs(MAP_PRIORITIES) do
+        if string.lower(name) == lowerMap then return i end
+    end
+    return 999
+end
+
+local function ScanVotePads()
+    local currentMaps = {}
+    local lobby = Workspace:FindFirstChild("Lobby")
+    local votePadsFolder = lobby and lobby:FindFirstChild("VotePads")
+    if not votePadsFolder then return currentMaps, "" end
+
+    local allNames = {}
+    for _, pad in ipairs(votePadsFolder:GetChildren()) do
+        if pad:IsA("BasePart") or pad:IsA("Model") then
+            local voteInfoGui = pad:FindFirstChild("VoteInfoGui", true)
+            if voteInfoGui then
+                -- Проверка активности интерфейса голосования на стенде
+                if (voteInfoGui:IsA("SurfaceGui") or voteInfoGui:IsA("BillboardGui") or voteInfoGui:IsA("ScreenGui")) and not (voteInfoGui :: any).Enabled then
+                    continue
+                end
+
+                local mapName: string? = nil
+                for _, desc in ipairs(voteInfoGui:GetDescendants()) do
+                    if desc:IsA("TextLabel") and desc.Visible and desc.TextTransparency < 1 then
+                        local isParentVisible = true
+                        local parent = desc.Parent
+                        while parent and parent ~= voteInfoGui do
+                            if parent:IsA("GuiObject") then
+                                if not parent.Visible then
+                                    isParentVisible = false
+                                    break
+                                end
+                                if parent:IsA("CanvasGroup") and (parent :: CanvasGroup).GroupTransparency >= 1 then
+                                    isParentVisible = false
+                                    break
+                                end
+                            end
+                            parent = parent.Parent
+                        end
+
+                        if isParentVisible then
+                            local cleanText = string.gsub(desc.Text, "^%s*(.-)%s*$", "%1")
+                            local lower = string.lower(cleanText)
+                            if cleanText ~= "" and lower ~= "label" and not string.find(lower, "votes") then
+                                if desc.Name == "MapName" or not mapName then
+                                    mapName = cleanText
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if mapName and mapName ~= "" then
+                    table.insert(allNames, mapName)
+                    local tpPart = pad:IsA("BasePart") and pad or (pad:IsA("Model") and (pad.PrimaryPart or pad:FindFirstChildWhichIsA("BasePart"))) or pad:FindFirstChildWhichIsA("BasePart")
+                    if tpPart then
+                        -- Идеальная высота (1.0 студ над центром Pad, Y = 466.5)
+                        currentMaps[mapName] = tpPart.CFrame + Vector3.new(0, 1.0, 0)
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(allNames)
+    local sessionStr = table.concat(allNames, "|")
+
+    return currentMaps, sessionStr
+end
+
+-- Основной цикл автофарма с защитой от падений
+local function RunFarmCycle()
+    while not IsTerminated do
+        if SETTINGS.AutoFarmEnabled then
+            local ok, err = pcall(function()
+                if CurrentState == State.WaitingForRound then WaitingForRound()
+                elseif CurrentState == State.Action then ActionState()
+                elseif CurrentState == State.WaitingForRoundEnd then waitForRoundEnd()
+                end
+            end)
+            if not ok then
+                warn("[MM2 AIO] Farm loop error: " .. tostring(err))
+                pcall(UnequipKnife)
+                BagIsFull = false
+                Working = false
+                CurrentState = State.WaitingForRound
+                task.wait(1)
+            end
+        end
+        task.wait()
+    end
+end
+
+task.spawn(function()
+    while not IsTerminated do
+        local ok, err = pcall(RunFarmCycle)
+        if not ok and not IsTerminated then
+            warn("[MM2 AIO] Farm loop restarted after error: " .. tostring(err))
+            task.wait(1)
+        end
+    end
+end)
+
+-- Основной цикл авто-голосования
+task.spawn(function()
+    while not IsTerminated and task.wait(0.5) do
+        if not SETTINGS.AutoVoteEnabled then continue end
+        if rt:CheckIfGameInProgress() then 
+            continue 
+        end
+
+        local availableMaps, currentSession = ScanVotePads()
+        
+        if currentSession ~= "" and currentSession ~= LastVoteSession then
+            LastVoteSession = currentSession
+            HasVoted = false
+            UpdateStatus("Голос: Новое голосование", Color3.fromRGB(150, 200, 255))
+        end
+        
+        if HasVoted then continue end
+        
+        local mapNames = {}
+        for name, _ in pairs(availableMaps) do table.insert(mapNames, name) end
+        if #mapNames < 2 then continue end
+
+        local bestMap, bestPriority, bestCFrame = nil, 999, nil
+        for name, tpCFrame in pairs(availableMaps) do
+            local priority = GetMapPriority(name)
+            if priority < bestPriority then
+                bestPriority = priority
+                bestMap = name
+                bestCFrame = tpCFrame
+            end
+        end
+
+        if bestMap and bestPriority < 999 and bestCFrame then
+            local maxVotes = SETTINGS.VoteSpamEnabled and 11 or 1
+            UpdateStatus(string.format("Голос: Старт (%s, %s)", bestMap, SETTINGS.VoteSpamEnabled and "спам до 11" or "1 голос"), Color3.fromRGB(50, 255, 255))
+
+            local voteCount = 0
+            isVotingNoclip = true
+
+            local currentChar = LocalPlayer.Character
+            local currentHrp = currentChar and (currentChar:FindFirstChild("HumanoidRootPart") or currentChar.PrimaryPart) :: BasePart?
+            local currentHum = currentChar and currentChar:FindFirstChildOfClass("Humanoid")
+
+            while voteCount < maxVotes and not IsTerminated and SETTINGS.AutoVoteEnabled do
+                if rt:CheckIfGameInProgress() then break end
+
+                -- Если персонаж еще не появился или мертв — ждем один раз
+                if not currentChar or not currentHrp or not currentHum or currentHum.Health <= 0 then
+                    currentChar = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+                    currentHrp = (currentChar:WaitForChild("HumanoidRootPart", 5) or currentChar.PrimaryPart) :: BasePart?
+                    currentHum = currentChar:WaitForChild("Humanoid", 5) :: Humanoid?
+                end
+
+                if not currentHrp or not currentHum then break end
+
+                -- Мгновенно отключаем коллизию нового тела
+                updateBodyPartsCache()
+                for _, part in ipairs(rt.cachedBodyParts) do
+                    if part and part.Parent then part.CanCollide = false end
+                end
+
+                -- Зависаем в воздухе без падения (BodyVelocity вместо Anchored)
+                local holdV = Instance.new("BodyVelocity")
+                holdV.Name = "VoteHover"
+                holdV.Velocity = Vector3.zero
+                holdV.MaxForce = Vector3.new(0, 9e9, 0)
+                holdV.Parent = currentHrp
+
+                currentHrp.AssemblyLinearVelocity = Vector3.zero
+                currentHrp.AssemblyAngularVelocity = Vector3.zero
+                currentChar:PivotTo(bestCFrame)
+
+                voteCount = voteCount + 1
+                UpdateStatus(string.format("Голос: [%s] (%d/%d)", bestMap, voteCount, maxVotes), Color3.fromRGB(50, 255, 255))
+
+                -- Пауза для фиксации пакета координат сервером MM2
+                task.wait(0.15)
+
+                if holdV and holdV.Parent then holdV:Destroy() end
+
+                -- Если спам выключен или лимит достигнут — выходим сразу БЕЗ сброса
+                if not SETTINGS.VoteSpamEnabled or voteCount >= maxVotes or rt:CheckIfGameInProgress() or not SETTINGS.AutoVoteEnabled then
+                    break
+                end
+
+                -- Сброс персонажа для получения следующего голоса
+                pcall(function()
+                    currentHum.Health = 0
+                    currentChar:BreakJoints()
+                end)
+
+                -- Ждем нового персонажа строго ОДИН раз
+                currentChar = LocalPlayer.CharacterAdded:Wait()
+                currentHrp = (currentChar:WaitForChild("HumanoidRootPart", 5) or currentChar.PrimaryPart) :: BasePart?
+                currentHum = currentChar:WaitForChild("Humanoid", 5) :: Humanoid?
+                -- В следующей итерации currentChar и currentHrp УЖЕ готовы,
+                -- поэтому телепорт произойдет мгновенно в 0-й миллисекунде появления!
+            end
+
+            isVotingNoclip = false
+            HasVoted = true
+            UpdateStatus(string.format("Голос: Завершено (%d за %s)", voteCount, bestMap), Color3.fromRGB(100, 255, 100))
+        end
+    end
+end)
+
+-- === ANTI-AFK ===
+RegisterConnection(LocalPlayer.Idled:Connect(function()
+    if IsTerminated then return end
+    VirtualUser:Button2Down(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
+    task.wait(0.1)
+    VirtualUser:Button2Up(Vector2.new(0,0), Workspace.CurrentCamera.CFrame)
+    UpdateStatus("Anti-AFK: Эмулирован клик", Color3.fromRGB(150, 150, 255))
+end))
+
+-- === ПОЛНОЕ ЗАКРЫТИЕ И ВЫГРУЗКА СКРИПТА ===
+local function TerminateScript()
+    if IsTerminated then return end
+    IsTerminated = true
+    
+    SETTINGS.AutoFarmEnabled = false
+    SETTINGS.AutoVoteEnabled = false
+    SETTINGS.AutoRejoinEnabled = false
+    RejoinPending = false
+    Working = false
+    UnequipKnife()
+    
+    for _, conn in ipairs(ActiveConnections) do
+        if conn and conn.Connected then
+            pcall(function() conn:Disconnect() end)
+        end
+    end
+    table.clear(ActiveConnections)
+
+    for child, _ in pairs(candidateConnections) do
+        DisconnectCandidate(child)
+    end
+    table.clear(candidateConnections)
+    
+    for _, conn in pairs(rt.potatoConnections) do
+        if conn and conn.Connected then
+            pcall(function() conn:Disconnect() end)
+        end
+    end
+    table.clear(rt.potatoConnections)
+    
+    AutoFarmCleanUp()
+    
+    pcall(function()
+        local char = LocalPlayer.Character
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            
+            if hum then
+                hum.PlatformStand = false
+            end
+            
+            if hrp then
+                local bv = hrp:FindFirstChild("FarmVelocity")
+                if bv then bv:Destroy() end
+                
+                local bg = hrp:FindFirstChild("FarmGyro")
+                if bg then bg:Destroy() end
+                
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end
+            
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+                    part.CanCollide = true
+                end
+            end
+        end
+    end)
+    
+    pcall(function()
+        setTargetFps(60)
+        StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.All, true)
+        RunService:Set3dRenderingEnabled(true)
+    end)
+    
+    if ScreenGui and ScreenGui.Parent then
+        ScreenGui:Destroy()
+    end
+    
+    print("[MM2 AIO] Скрипт полностью остановлен и выгружен.")
+end
+
+BindClick(CloseBtn, TerminateScript)
