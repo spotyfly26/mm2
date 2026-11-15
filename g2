@@ -1,4 +1,7 @@
 --!nocheck
+type TwinMotionEntry__DARKLUA_TYPE_a = {lastDir: Vector3?, lastSpeed: number, lastMoveClock: number, anchorPos: Vector3, stationarySince: number}
+type ActiveTwinData__DARKLUA_TYPE_b = {plr: Player, pos: Vector3, predPos: Vector3?, claimedTarget: Vector3?, nextTarget: Vector3?, anchorPos: Vector3, isMeLeaderOverTwin: boolean}
+
 local __DARKLUA_BUNDLE_MODULES = {
     cache = {}::any,
 }
@@ -7,6 +10,7 @@ do
     do
         local function __modImpl()
             local HttpService = game:GetService('HttpService')
+            local Players = game:GetService('Players')
             local Config = {}
 
             Config.CONFIG_FOLDER = 'MM2AIO'
@@ -14,12 +18,38 @@ do
             Config.LEGACY_MAP_SIZES_FILE = 'mm2_map_sizes.json'
             Config.SPAWNS_SCHEMA_KEY = '_spawns'
             Config.PROFILE_FILE = Config.CONFIG_FOLDER .. '/profile.json'
-            Config.LEGACY_PROFILE_FILES = {
-                'profile',
-                'profile.json',
-            }
             Config.MapSizesCache = {}::{[string]: number}
 
+            function Config.SanitizeFileName(name: string?): string
+                local raw = name
+
+                if not raw or raw == '' then
+                    local lp = Players.LocalPlayer
+
+                    raw = lp and lp.Name or 'default'
+                end
+
+                local clean = string.gsub(tostring(raw), '[^%w_%-]', '_')
+
+                if clean == '' then
+                    clean = 'default'
+                end
+
+                return clean
+            end
+            function Config.GetProfileFile(playerName: string?): string
+                local safeName = Config.SanitizeFileName(playerName)
+                local path = Config.CONFIG_FOLDER .. '/' .. safeName .. '_profile.json'
+
+                Config.PROFILE_FILE = path
+
+                return path
+            end
+            function Config.GetLegacyProfileFile(playerName: string?): string
+                local safeName = Config.SanitizeFileName(playerName)
+
+                return safeName .. '_profile.json'
+            end
             function Config.EnsureConfigFolder(): boolean
                 local mf = makefolder or (syn and syn.makefolder)
                 local isfld = isfolder or (syn and syn.isfolder)
@@ -156,17 +186,15 @@ do
 
                 return trimmed
             end
-            function Config.LoadProfile(): {[string]: any}?
+            function Config.LoadProfile(playerName: string?): {[string]: any}?
                 local rf = readfile or (syn and syn.readfile)
                 local isf = isfile or (syn and syn.isfile)
+                local profilePath = Config.GetProfileFile(playerName)
+                local legacyPath = Config.GetLegacyProfileFile(playerName)
 
                 if typeof(isf) == 'function' and typeof(rf) == 'function' then
                     local targetFile: string? = nil
-                    local candidates = {
-                        Config.PROFILE_FILE,
-                        Config.LEGACY_PROFILE_FILES[1],
-                        Config.LEGACY_PROFILE_FILES[2],
-                    }
+                    local candidates = {profilePath, legacyPath}
 
                     for _, candidate in ipairs(candidates)do
                         local ok, exists = pcall(isf, candidate)
@@ -198,7 +226,8 @@ do
             function Config.SaveProfile(
                 settings: {[string]: any},
                 statsVisible: boolean?,
-                rejoinVisible: boolean?
+                rejoinVisible: boolean?,
+                playerName: string?
             ): boolean
                 local wf = writefile or (syn and syn.writefile)
 
@@ -226,7 +255,9 @@ do
                     end)
 
                     if encodeOk and typeof(jsonStr) == 'string' then
-                        local savePath = Config.EnsureConfigFolder() and Config.PROFILE_FILE or Config.LEGACY_PROFILE_FILES[1]
+                        local profilePath = Config.GetProfileFile(playerName)
+                        local legacyPath = Config.GetLegacyProfileFile(playerName)
+                        local savePath = Config.EnsureConfigFolder() and profilePath or legacyPath
                         local writeOk = pcall(wf, savePath, jsonStr)
 
                         return writeOk
@@ -234,6 +265,202 @@ do
                 end
 
                 return false
+            end
+
+            local SYNC_TTL_SECONDS = 8
+            local SYNC_READ_INTERVAL = 0.25
+            local SYNC_HEARTBEAT_INTERVAL = 3
+            local twinSyncReadCache: {[string]: {data: {[string]: any}?, readAt: number}} = {}
+            local lastWrittenSyncJson = ''
+            local lastWrittenSyncAt = 0
+
+            function Config.GetSyncFile(
+                playerName: string?,
+                useFolder: boolean?
+            ): string
+                local safeLower = string.lower(Config.SanitizeFileName(playerName))
+                local fileName = safeLower .. '_sync.json'
+
+                if useFolder == false then
+                    return fileName
+                end
+
+                return Config.CONFIG_FOLDER .. '/' .. fileName
+            end
+
+            local function RoundCoord(n: number): number
+                return math.floor(n * 10 + 0.5) / 10
+            end
+
+            function Config.WriteTwinSync(
+                farming: boolean,
+                bagFull: boolean,
+                targetPos: Vector3?,
+                nextPos: Vector3?
+            ): boolean
+                local wf = writefile or (syn and syn.writefile)
+
+                if typeof(wf) ~= 'function' then
+                    return false
+                end
+
+                local lp = Players.LocalPlayer
+
+                if not lp then
+                    return false
+                end
+
+                local payload: {[string]: any} = {
+                    jobId = tostring(game.JobId or ''),
+                    farming = (farming == true),
+                    bagFull = (bagFull == true),
+                }
+
+                if targetPos then
+                    payload.tx = RoundCoord(targetPos.X)
+                    payload.ty = RoundCoord(targetPos.Y)
+                    payload.tz = RoundCoord(targetPos.Z)
+                end
+                if nextPos then
+                    payload.nx = RoundCoord(nextPos.X)
+                    payload.ny = RoundCoord(nextPos.Y)
+                    payload.nz = RoundCoord(nextPos.Z)
+                end
+
+                local stateKeyOk, stateKey = pcall(function()
+                    return HttpService:JSONEncode(payload)
+                end)
+
+                if not stateKeyOk or typeof(stateKey) ~= 'string' then
+                    return false
+                end
+
+                local nowClock = os.clock()
+
+                if stateKey == lastWrittenSyncJson and (nowClock - lastWrittenSyncAt) < SYNC_HEARTBEAT_INTERVAL then
+                    return true
+                end
+
+                payload.ts = os.time()
+
+                local encodeOk, jsonStr = pcall(function()
+                    return HttpService:JSONEncode(payload)
+                end)
+
+                if not encodeOk or typeof(jsonStr) ~= 'string' then
+                    return false
+                end
+
+                local hasFolder = Config.EnsureConfigFolder()
+                local savePath = Config.GetSyncFile(lp.Name, hasFolder)
+                local writeOk = pcall(wf, savePath, jsonStr)
+
+                if writeOk then
+                    lastWrittenSyncJson = stateKey
+                    lastWrittenSyncAt = nowClock
+                end
+
+                return writeOk
+            end
+            function Config.ReadTwinSync(twinName: string): {[string]: any}?
+                if not twinName or twinName == '' then
+                    return nil
+                end
+
+                local key = string.lower(Config.SanitizeFileName(twinName))
+                local nowClock = os.clock()
+                local cachedEntry = twinSyncReadCache[key]
+
+                if cachedEntry and (nowClock - cachedEntry.readAt) < SYNC_READ_INTERVAL then
+                    local d = cachedEntry.data
+
+                    if d and typeof(d.ts) == 'number' and math.abs(os.time() - d.ts) <= SYNC_TTL_SECONDS then
+                        return d
+                    end
+
+                    return nil
+                end
+
+                local rf = readfile or (syn and syn.readfile)
+                local isf = isfile or (syn and syn.isfile)
+
+                if typeof(isf) ~= 'function' or typeof(rf) ~= 'function' then
+                    return nil
+                end
+
+                local targetFile: string? = nil
+
+                for _, candidate in ipairs({
+                    Config.GetSyncFile(key, true),
+                    Config.GetSyncFile(key, false),
+                })do
+                    local ok, exists = pcall(isf, candidate)
+
+                    if ok and exists then
+                        targetFile = candidate
+
+                        break
+                    end
+                end
+
+                if not targetFile then
+                    twinSyncReadCache[key] = {
+                        data = nil,
+                        readAt = nowClock,
+                    }
+
+                    return nil
+                end
+
+                local readOk, content = pcall(rf, targetFile)
+
+                if readOk and typeof(content) == 'string' and content ~= '' then
+                    local decodeOk, data = pcall(function()
+                        return HttpService:JSONDecode(content)
+                    end)
+
+                    if decodeOk and typeof(data) == 'table' then
+                        local myJobId = tostring(game.JobId or '')
+                        local sameServer = (myJobId == '' or data.jobId == '' or data.jobId == myJobId)
+                        local fresh = (typeof(data.ts) == 'number' and math.abs(os.time() - data.ts) <= SYNC_TTL_SECONDS)
+
+                        if sameServer and fresh then
+                            twinSyncReadCache[key] = {
+                                data = data,
+                                readAt = nowClock,
+                            }
+
+                            return data
+                        else
+                            twinSyncReadCache[key] = {
+                                data = nil,
+                                readAt = nowClock,
+                            }
+
+                            return nil
+                        end
+                    end
+                end
+                if cachedEntry and cachedEntry.data and typeof(cachedEntry.data.ts) == 'number' then
+                    if math.abs(os.time() - cachedEntry.data.ts) <= SYNC_TTL_SECONDS then
+                        cachedEntry.readAt = nowClock
+
+                        return cachedEntry.data
+                    end
+                end
+
+                twinSyncReadCache[key] = {
+                    data = nil,
+                    readAt = nowClock,
+                }
+
+                return nil
+            end
+            function Config.ClearTwinSyncCache()
+                table.clear(twinSyncReadCache)
+
+                lastWrittenSyncJson = ''
+                lastWrittenSyncAt = 0
             end
 
             return Config
@@ -321,7 +548,7 @@ do
             function State.LoadInitialSettings()
                 Config.MapSizesCache = Config.LoadMapSizes()
 
-                local initialProfile = Config.LoadProfile()
+                local initialProfile = Config.LoadProfile(LocalPlayer.Name)
                 local initialSavedTwin = Config.SanitizeTwinName(initialProfile and initialProfile.TwinName)
                 local isInitialRejoinPanel = (initialProfile and initialProfile.RejoinPanelVisible == true) or false
                 local isInitialStats = (initialProfile and initialProfile.StatsPanelVisible == true) or false
@@ -347,6 +574,10 @@ do
                 s.RejoinTime = Config.ClampNumber(initialProfile and initialProfile.RejoinTime, 5, 86400, 5400)
                 s.RejoinServerMode = (initialProfile and (initialProfile.RejoinServerMode == 'Same' or initialProfile.RejoinServerMode == 'Random') and initialProfile.RejoinServerMode) or 'Same'
                 s.ScaleIndex = Config.ClampNumber(initialProfile and initialProfile.ScaleIndex, 1, 4, 1)
+
+                if not initialProfile then
+                    Config.SaveProfile(s, isInitialStats, isInitialRejoinPanel, LocalPlayer.Name)
+                end
             end
 
             State.StatsData = {
@@ -4752,7 +4983,7 @@ do
                         SaveProfileBtn.Text = '\u{2705} \u{41f}\u{420}\u{41e}\u{424}\u{418}\u{41b}\u{42c} \u{421}\u{41e}\u{425}\u{420}\u{410}\u{41d}\u{415}\u{41d}!'
                         SaveProfileBtn.BackgroundColor3 = Color3.fromRGB(40, 180, 80)
 
-                        State.UpdateStatus('\u{41f}\u{440}\u{43e}\u{444}\u{438}\u{43b}\u{44c} \u{441}\u{43e}\u{445}\u{440}\u{430}\u{43d}\u{435}\u{43d} \u{432} workspace/' .. Config.PROFILE_FILE, Color3.fromRGB(100, 255, 100))
+                        State.UpdateStatus('\u{41f}\u{440}\u{43e}\u{444}\u{438}\u{43b}\u{44c} \u{441}\u{43e}\u{445}\u{440}\u{430}\u{43d}\u{435}\u{43d} \u{432} workspace/' .. Config.GetProfileFile(), Color3.fromRGB(100, 255, 100))
                         task.delay(1.5, function()
                             if not State.IsTerminated and SaveProfileBtn then
                                 SaveProfileBtn.Text = '\u{1f4be} \u{421}\u{41e}\u{425}\u{420}\u{410}\u{41d}\u{418}\u{422}\u{42c} \u{41f}\u{420}\u{41e}\u{424}\u{418}\u{41b}\u{42c}'
@@ -5028,8 +5259,10 @@ do
                 end)
             end
             function Gui.ApplyInitialProfile()
+                local profilePath = Config.GetProfileFile()
+
                 if State.initialProfile then
-                    State.UpdateStatus('\u{41f}\u{440}\u{43e}\u{444}\u{438}\u{43b}\u{44c} \u{437}\u{430}\u{433}\u{440}\u{443}\u{436}\u{435}\u{43d} (' .. Config.PROFILE_FILE .. ')', Color3.fromRGB(100, 255, 200))
+                    State.UpdateStatus('\u{41f}\u{440}\u{43e}\u{444}\u{438}\u{43b}\u{44c} \u{437}\u{430}\u{433}\u{440}\u{443}\u{436}\u{435}\u{43d} (' .. profilePath .. ')', Color3.fromRGB(100, 255, 200))
 
                     if SETTINGS.PotatoMode then
                         PotatoMode.applyPotatoMode()
@@ -5039,6 +5272,8 @@ do
 
                         State.ChangeState(State.WaitingForRound)
                     end
+                else
+                    State.UpdateStatus('\u{421}\u{43e}\u{437}\u{434}\u{430}\u{43d} \u{43f}\u{440}\u{43e}\u{444}\u{438}\u{43b}\u{44c} (' .. profilePath .. ')', Color3.fromRGB(150, 220, 255))
                 end
             end
             function Gui.BindCloseButton(terminateFn: () -> ())
@@ -5065,6 +5300,7 @@ do
     end
     do
         local function __modImpl()
+            local Config = __DARKLUA_BUNDLE_MODULES.a()
             local State = __DARKLUA_BUNDLE_MODULES.b()
             local MapTracker = __DARKLUA_BUNDLE_MODULES.c()
             local Network = __DARKLUA_BUNDLE_MODULES.e()
@@ -5077,11 +5313,24 @@ do
             local SETTINGS = State.SETTINGS
             local rt = State.rt
             local AutoFarm = {}
+            local twinMotionCache: {[string]: TwinMotionEntry__DARKLUA_TYPE_a} = {}
+
+            local function PublishTwinSync(
+                farming: boolean,
+                targetPos: Vector3?,
+                nextPos: Vector3?
+            )
+                if SETTINGS.GameMode == 'Twin' or Network.HasTwinsConfigured() then
+                    Config.WriteTwinSync(farming, State.BagIsFull, targetPos, nextPos)
+                end
+            end
 
             function AutoFarm.AutoFarmCleanUp()
                 table.clear(rt.touchedCoins)
                 table.clear(rt.cachedCoins)
                 table.clear(rt.cachedBodyParts)
+                table.clear(twinMotionCache)
+                PublishTwinSync(false, nil, nil)
                 State.DisconnectCharDescConn()
 
                 if rt.Added then
@@ -5189,66 +5438,171 @@ do
                     end
                 end)
             end
-            function AutoFarm.GetNearestCoin(isFirstCoin: boolean?): Instance?
-                local char = rt:Character()
 
-                if not char or not char.PrimaryPart then
-                    return nil
+            local function GetActiveTwinsInfo(): ({ActiveTwinData__DARKLUA_TYPE_b},boolean)
+                local activeTwins: {ActiveTwinData__DARKLUA_TYPE_b} = {}
+                local isOverallLeader = true
+
+                if not SETTINGS.TwinAvoidEnabled or not Network.HasTwinsConfigured() then
+                    return activeTwins, true
                 end
 
-                local myPos = char.PrimaryPart.Position
-                local twinPos: Vector3? = nil
-                local twinPredPos: Vector3? = nil
-                local twinPlr: Player? = nil
+                local myNameLower = string.lower(LocalPlayer.Name)
+                local nowClock = os.clock()
 
-                if SETTINGS.TwinAvoidEnabled and Network.HasTwinsConfigured() then
-                    for _, plr in ipairs(Players:GetPlayers())do
-                        if plr ~= LocalPlayer and Network.IsTwinPlayer(plr, plr.Name) then
-                            if Network.IsPlayerActuallyAlive(plr) then
-                                local tChar = plr.Character
-                                local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild('HumanoidRootPart') or tChar:FindFirstChildWhichIsA('BasePart'))
+                for _, plr in ipairs(Players:GetPlayers())do
+                    if plr ~= LocalPlayer and Network.IsTwinPlayer(plr, plr.Name) and Network.IsPlayerActuallyAlive(plr) then
+                        local tChar = plr.Character
+                        local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild('HumanoidRootPart') or tChar:FindFirstChildWhichIsA('BasePart'))
 
-                                if tHrp then
-                                    twinPos = tHrp.Position
-                                    twinPlr = plr
+                        if tHrp then
+                            local sync = Config.ReadTwinSync(plr.Name)
 
-                                    local vel = tHrp.AssemblyLinearVelocity
+                            if sync and (sync.bagFull == true or sync.farming == false) then
+                                continue
+                            end
 
-                                    if vel and vel.Magnitude > 3 then
-                                        twinPredPos = twinPos + (vel.Unit * math.min(vel.Magnitude * 1.8, 50))
-                                    end
+                            local tPos = tHrp.Position
+                            local vel = tHrp.AssemblyLinearVelocity
+                            local speed = vel and vel.Magnitude or 0
+                            local mEntry = twinMotionCache[plr.Name]
+
+                            if not mEntry then
+                                mEntry = {
+                                    lastDir = nil,
+                                    lastSpeed = 0,
+                                    lastMoveClock = nowClock,
+                                    anchorPos = tPos,
+                                    stationarySince = nowClock,
+                                }
+                                twinMotionCache[plr.Name] = mEntry
+                            else
+                                if (tPos - mEntry.anchorPos).Magnitude > 1.8 or speed > 2.5 then
+                                    mEntry.anchorPos = tPos
+                                    mEntry.stationarySince = nowClock
+                                end
+                                if speed > 3 then
+                                    mEntry.lastDir = vel.Unit
+                                    mEntry.lastSpeed = speed
+                                    mEntry.lastMoveClock = nowClock
+                                end
+                            end
+                            if not sync and (nowClock - mEntry.stationarySince) > 3.5 then
+                                continue
+                            end
+
+                            local claimedTarget: Vector3? = nil
+                            local nextTarget: Vector3? = nil
+
+                            if sync then
+                                if typeof(sync.tx) == 'number' and typeof(sync.ty) == 'number' and typeof(sync.tz) == 'number' then
+                                    claimedTarget = Vector3.new(sync.tx, sync.ty, sync.tz)
+                                end
+                                if typeof(sync.nx) == 'number' and typeof(sync.ny) == 'number' and typeof(sync.nz) == 'number' then
+                                    nextTarget = Vector3.new(sync.nx, sync.ny, sync.nz)
                                 end
                             end
 
-                            break
+                            local predPos: Vector3? = nil
+
+                            if speed > 3 then
+                                predPos = tPos + (vel.Unit * math.min(speed * 1.8, 50))
+                            elseif mEntry.lastDir and (nowClock - mEntry.lastMoveClock) < 0.45 then
+                                predPos = tPos + (mEntry.lastDir * math.min(mEntry.lastSpeed * 1.3, 38))
+                            elseif claimedTarget then
+                                predPos = claimedTarget
+                            end
+
+                            local twinNameLower = string.lower(plr.Name)
+                            local meLeaderOverThis = (myNameLower < twinNameLower)
+
+                            if not meLeaderOverThis then
+                                isOverallLeader = false
+                            end
+
+                            table.insert(activeTwins, {
+                                plr = plr,
+                                pos = tPos,
+                                predPos = predPos,
+                                claimedTarget = claimedTarget,
+                                nextTarget = nextTarget,
+                                anchorPos = claimedTarget or tPos,
+                                isMeLeaderOverTwin = meLeaderOverThis,
+                            })
                         end
                     end
                 end
 
-                local isLeader = true
+                return activeTwins, isOverallLeader
+            end
 
-                if twinPlr then
-                    isLeader = (string.lower(LocalPlayer.Name) < string.lower(twinPlr.Name))
+            function AutoFarm.GetNearestCoin(isFirstCoin: boolean?): (Instance?,Vector3?)
+                local char = rt:Character()
+
+                if not char or not char.PrimaryPart then
+                    return nil, nil
                 end
 
-                local bestCoin = nil
-                local bestDist = (isFirstCoin and not isLeader) and -1 or math.huge
-                local fallbackCoin = nil
+                local myPos = char.PrimaryPart.Position
+                local activeTwins, isOverallLeader = GetActiveTwinsInfo()
+                local hasActiveTwins = (#activeTwins > 0)
+                local bestCoin: Instance? = nil
+                local bestScore = (isFirstCoin and hasActiveTwins and not isOverallLeader) and 
+-math.huge or math.huge
+                local secondBestPos: Vector3? = nil
+                local secondBestDist = math.huge
+                local fallbackCoin: Instance? = nil
                 local fallbackDist = math.huge
+                local claimedFallbackCoin: Instance? = nil
+                local claimedFallbackDist = math.huge
                 local avoidRadius = SETTINGS.TwinAvoidRadius or 30
 
                 for coin, _ in pairs(rt.cachedCoins)do
                     if coin and coin.Parent and not isCoinTouched(coin) and coin:FindFirstChildWhichIsA('TouchTransmitter') then
                         local coinPos = (coin::BasePart).Position
                         local myDist = (coinPos - myPos).Magnitude
+                        local isHardClaimedByTwin = false
 
+                        if hasActiveTwins then
+                            for _, twin in ipairs(activeTwins)do
+                                if twin.claimedTarget and (coinPos - twin.claimedTarget).Magnitude < 4.5 then
+                                    local twinDistToClaim = (coinPos - twin.pos).Magnitude
+
+                                    if not (myDist + 4 < twinDistToClaim and twin.isMeLeaderOverTwin) then
+                                        isHardClaimedByTwin = true
+
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if isHardClaimedByTwin then
+                            if myDist < claimedFallbackDist then
+                                claimedFallbackDist = myDist
+                                claimedFallbackCoin = coin
+                            end
+
+                            continue
+                        end
                         if myDist < fallbackDist then
                             fallbackDist = myDist
                             fallbackCoin = coin
                         end
-                        if isFirstCoin and twinPlr and not isLeader then
-                            if myDist > bestDist then
-                                bestDist = myDist
+                        if isFirstCoin and hasActiveTwins and not isOverallLeader then
+                            local minTwinAnchorDist = math.huge
+
+                            for _, twin in ipairs(activeTwins)do
+                                local d = (coinPos - twin.anchorPos).Magnitude
+
+                                if d < minTwinAnchorDist then
+                                    minTwinAnchorDist = d
+                                end
+                            end
+
+                            local startScore = minTwinAnchorDist - (myDist * 0.2)
+
+                            if startScore > bestScore then
+                                bestScore = startScore
                                 bestCoin = coin
                             end
 
@@ -5257,23 +5611,46 @@ do
 
                         local isTwinZone = false
 
-                        if twinPos then
-                            local botsDist = (myPos - twinPos).Magnitude
-                            local minSafeDist = (botsDist < 25) and 4 or 12
-
-                            if myDist > minSafeDist then
-                                local twinDist = (coinPos - twinPos).Magnitude
-                                local predDist = twinPredPos and (coinPos - twinPredPos).Magnitude or math.huge
-
-                                if (twinDist < avoidRadius) or (predDist < 18) or (twinDist < myDist) or (twinDist == myDist and not isLeader) then
+                        if hasActiveTwins then
+                            for _, twin in ipairs(activeTwins)do
+                                if twin.claimedTarget and (coinPos - twin.claimedTarget).Magnitude < 14 then
                                     isTwinZone = true
+
+                                    break
+                                end
+                                if twin.nextTarget and (coinPos - twin.nextTarget).Magnitude < 10 then
+                                    isTwinZone = true
+
+                                    break
+                                end
+
+                                local botsDist = (myPos - twin.pos).Magnitude
+                                local minSafeDist = (botsDist < 25) and 4 or 12
+
+                                if myDist > minSafeDist then
+                                    local twinDist = (coinPos - twin.pos).Magnitude
+                                    local predDist = twin.predPos and (coinPos - twin.predPos).Magnitude or math.huge
+
+                                    if (twinDist < avoidRadius) or (predDist < 18) or (twinDist < myDist) or (twinDist == myDist and not twin.isMeLeaderOverTwin) then
+                                        isTwinZone = true
+
+                                        break
+                                    end
                                 end
                             end
                         end
                         if not isTwinZone then
-                            if myDist < bestDist then
-                                bestDist = myDist
+                            if myDist < bestScore then
+                                if bestCoin then
+                                    secondBestDist = bestScore
+                                    secondBestPos = (bestCoin::BasePart).Position
+                                end
+
+                                bestScore = myDist
                                 bestCoin = coin
+                            elseif myDist < secondBestDist then
+                                secondBestDist = myDist
+                                secondBestPos = coinPos
                             end
                         end
                     else
@@ -5281,7 +5658,9 @@ do
                     end
                 end
 
-                return bestCoin or fallbackCoin
+                local chosen = bestCoin or fallbackCoin or claimedFallbackCoin
+
+                return chosen, secondBestPos
             end
 
             local function moveToPositionPhysically(
@@ -5289,11 +5668,11 @@ do
                 targetCoin: Instance,
                 bv: BodyVelocity,
                 bg: BodyGyro
-            ): boolean
+            ): (boolean,boolean)
                 local char = rt:Character()
 
                 if not char or not char.PrimaryPart then
-                    return false
+                    return false, false
                 end
 
                 local hrp = char.PrimaryPart
@@ -5319,9 +5698,12 @@ do
                 end
 
                 local flyStart = os.clock()
+                local lastHijackCheck = 0
 
                 while not State.IsTerminated and SETTINGS.AutoFarmEnabled and char and char.PrimaryPart and State.CurrentState == State.Action do
-                    if os.clock() - flyStart > 6 then
+                    local now = os.clock()
+
+                    if now - flyStart > 6 then
                         break
                     end
 
@@ -5338,12 +5720,30 @@ do
                         rt.touchedCoins[targetCoin] = 'collected'
                         rt.cachedCoins[targetCoin] = nil
 
-                        return true
+                        return true, false
                     end
 
                     local currentPos = hrp.Position
                     local distance = (finalPosition - currentPos).Magnitude
 
+                    if distance > 5 and (now - lastHijackCheck) >= 0.15 then
+                        lastHijackCheck = now
+
+                        local activeTwins = GetActiveTwinsInfo()
+
+                        for _, twin in ipairs(activeTwins)do
+                            local twinDistToTarget = (targetPosition - twin.pos).Magnitude
+                            local twinClaimedThis = (twin.claimedTarget ~= nil and (targetPosition - twin.claimedTarget).Magnitude < 4.5)
+
+                            if (twinDistToTarget < 6.5 and distance > 12) or (twinClaimedThis and (twinDistToTarget + 2 < distance or (math.abs(twinDistToTarget - distance) <= 2 and not twin.isMeLeaderOverTwin))) then
+                                if cRemoved then
+                                    cRemoved:Disconnect()
+                                end
+
+                                return false, true
+                            end
+                        end
+                    end
                     if distance < 2 then
                         local touchFn = firetouchtransmitter or firetouchinterest or (syn and syn.firetouchinterest)
                         local touchPart = char:FindFirstChild('Head') or hrp
@@ -5373,7 +5773,7 @@ do
                         rt.touchedCoins[targetCoin] = 'collected'
                         rt.cachedCoins[targetCoin] = nil
 
-                        return true
+                        return true, false
                     end
 
                     local direction = (finalPosition - currentPos).Unit
@@ -5387,7 +5787,7 @@ do
                     cRemoved:Disconnect()
                 end
 
-                return false
+                return false, false
             end
             local function CollectCoins()
                 State.BagIsFull = false
@@ -5448,10 +5848,12 @@ do
 
                     hrp = char.PrimaryPart
 
-                    local targetCoin = AutoFarm.GetNearestCoin(isFirstCoin)
+                    local targetCoin, nextCoinPos = AutoFarm.GetNearestCoin(isFirstCoin)
 
                     if targetCoin then
                         local targetBasePart = targetCoin::BasePart
+
+                        PublishTwinSync(true, targetBasePart.Position, nextCoinPos)
 
                         if isFirstCoin then
                             isFirstCoin = false
@@ -5489,7 +5891,7 @@ do
                         State.UpdateStatus('\u{424}\u{430}\u{440}\u{43c}: \u{41b}\u{435}\u{447}\u{443} \u{43a} \u{43c}\u{43e}\u{43d}\u{435}\u{442}\u{435}', Color3.fromRGB(150, 255, 150))
                         markCoinAsPending(targetCoin)
 
-                        local pickedUp = moveToPositionPhysically(targetBasePart.Position, targetCoin, bv, bg)
+                        local pickedUp, wasHijacked = moveToPositionPhysically(targetBasePart.Position, targetCoin, bv, bg)
 
                         if not SETTINGS.AutoFarmEnabled or State.IsTerminated then
                             break
@@ -5499,6 +5901,11 @@ do
 
                             if IsBagFull() then
                                 break
+                            end
+                        elseif wasHijacked and rt.touchedCoins[targetCoin] == 'pending' then
+                            if targetCoin.Parent and targetCoin:FindFirstChildWhichIsA('TouchTransmitter') then
+                                rt.touchedCoins[targetCoin] = nil
+                                rt.cachedCoins[targetCoin] = true
                             end
                         elseif not pickedUp and rt.touchedCoins[targetCoin] == 'pending' and targetCoin.Parent and targetCoin:FindFirstChildWhichIsA('TouchTransmitter') then
                             local tries = (coinRetries[targetCoin] or 0) + 1
@@ -5511,6 +5918,8 @@ do
                             end
                         end
                     else
+                        PublishTwinSync(false, nil, nil)
+
                         if not rt.coinContainer then
                             local currentMap = MapTracker.Map()
 
@@ -5534,6 +5943,8 @@ do
                         task.wait(0.1)
                     end
                 end
+
+                PublishTwinSync(false, nil, nil)
 
                 if bv and bv.Parent then
                     bv:Destroy()
@@ -5787,6 +6198,7 @@ do
                     State.DisconnectCharDescConn()
                     table.clear(rt.cachedBodyParts)
                     AutoFarm.AutoFarmCleanUp()
+                    Config.ClearTwinSyncCache()
                 end)
             end
 
