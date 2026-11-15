@@ -602,13 +602,18 @@ do
             rt.Players = Players
             rt.player = LocalPlayer
             rt.coinContainer = nil::Instance?
-            rt.touchedCoins = {}::{[Instance]: string}
-            rt.cachedCoins = {}::{[Instance]: boolean}
+            rt.touchedCoins = setmetatable({}, {
+                __mode = 'k',
+            })::any
+            rt.cachedCoins = setmetatable({}, {
+                __mode = 'k',
+            })::any
             rt.potatoConnections = {}::{RBXScriptConnection}
             rt.Added = nil::RBXScriptConnection?
             rt.coinRemovedConn = nil::RBXScriptConnection?
             rt.ancestryConn = nil::RBXScriptConnection?
             rt.charDescConn = nil::RBXScriptConnection?
+            rt.charDescRemConn = nil::RBXScriptConnection?
             rt.cachedBodyParts = {}::{BasePart}
 
             function rt:Character(): Model?
@@ -659,6 +664,15 @@ do
 
                     rt.charDescConn = nil
                 end
+                if rt.charDescRemConn then
+                    if rt.charDescRemConn.Connected then
+                        pcall(function()
+                            rt.charDescRemConn:Disconnect()
+                        end)
+                    end
+
+                    rt.charDescRemConn = nil
+                end
             end
             function State.UpdateBodyPartsCache()
                 table.clear(rt.cachedBodyParts)
@@ -678,7 +692,23 @@ do
 
                 rt.charDescConn = char.DescendantAdded:Connect(function(desc)
                     if not State.IsTerminated and desc:IsA('BasePart') then
-                        table.insert(rt.cachedBodyParts, desc)
+                        if not table.find(rt.cachedBodyParts, desc) then
+                            table.insert(rt.cachedBodyParts, desc)
+                        end
+                    end
+                end)
+                rt.charDescRemConn = char.DescendantRemoving:Connect(function(
+                    desc
+                )
+                    if desc:IsA('BasePart') then
+                        local idx = table.find(rt.cachedBodyParts, desc)
+
+                        if idx then
+                            local last = #rt.cachedBodyParts
+
+                            rt.cachedBodyParts[idx] = rt.cachedBodyParts[last]
+                            rt.cachedBodyParts[last] = nil
+                        end
                     end
                 end)
             end
@@ -717,6 +747,10 @@ do
             State.ActiveConnections = ActiveConnections
 
             function State.RegisterConnection(conn: RBXScriptConnection): RBXScriptConnection
+                if #ActiveConnections >= 40 then
+                    State.PruneActiveConnections()
+                end
+
                 table.insert(ActiveConnections, conn)
 
                 return conn
@@ -1550,6 +1584,9 @@ do
             local BagConnections: {[Instance]: {RBXScriptConnection}} = setmetatable({}, {
                 __mode = 'k',
             })::any
+            local activeContainerCleanups: {() -> ()} = {}
+            local mainGuiDescConn: RBXScriptConnection? = nil
+            local mainGuiAncConn: RBXScriptConnection? = nil
 
             local function DisconnectBag(bagFrame: Instance)
                 local conns = BagConnections[bagFrame]
@@ -1566,6 +1603,48 @@ do
                     BagConnections[bagFrame] = nil
                 end
             end
+            local function DisconnectAllBags()
+                for _, conns in pairs(BagConnections)do
+                    for _, c in ipairs(conns)do
+                        if c and c.Connected then
+                            pcall(function()
+                                c:Disconnect()
+                            end)
+                        end
+                    end
+                end
+
+                table.clear(BagConnections)
+            end
+            local function CleanupMainGuiHooks()
+                for _, cleanupFn in ipairs(activeContainerCleanups)do
+                    pcall(cleanupFn)
+                end
+
+                table.clear(activeContainerCleanups)
+                DisconnectAllBags()
+
+                if mainGuiDescConn then
+                    if mainGuiDescConn.Connected then
+                        pcall(function()
+                            mainGuiDescConn:Disconnect()
+                        end)
+                    end
+
+                    mainGuiDescConn = nil
+                end
+                if mainGuiAncConn then
+                    if mainGuiAncConn.Connected then
+                        pcall(function()
+                            mainGuiAncConn:Disconnect()
+                        end)
+                    end
+
+                    mainGuiAncConn = nil
+                end
+
+                State.PruneActiveConnections()
+            end
 
             function GameUiTracker.SetupBagParser()
                 task.spawn(function()
@@ -1578,7 +1657,6 @@ do
                     local hookedContainers: {[Instance]: boolean} = setmetatable({}, {
                         __mode = 'k',
                     })::any
-                    local mainGuiDescConn: RBXScriptConnection? = nil
 
                     local function isBagActuallyVisible(
                         bagFrame: GuiObject,
@@ -1838,6 +1916,8 @@ do
                             State.PruneActiveConnections()
                         end
 
+                        table.insert(activeContainerCleanups, disconnectContainer)
+
                         containerAddConn = container.ChildAdded:Connect(function(
                             child
                         )
@@ -1880,6 +1960,8 @@ do
                             return
                         end
 
+                        CleanupMainGuiHooks()
+
                         local gameObj = mainGui:FindFirstChild('Game')
                         local gameBags = gameObj and gameObj:FindFirstChild('CoinBags')
                         local gameContainer = gameBags and gameBags:FindFirstChild('Container')
@@ -1904,13 +1986,6 @@ do
                                 hookContainer(anyContainer)
                             end
                         end
-                        if mainGuiDescConn then
-                            mainGuiDescConn:Disconnect()
-
-                            mainGuiDescConn = nil
-
-                            State.PruneActiveConnections()
-                        end
 
                         mainGuiDescConn = mainGui.DescendantAdded:Connect(function(
                             desc
@@ -1925,6 +2000,19 @@ do
 
                         if mainGuiDescConn then
                             State.RegisterConnection(mainGuiDescConn)
+                        end
+
+                        mainGuiAncConn = mainGui.AncestryChanged:Connect(function(
+                            _,
+                            parent
+                        )
+                            if not parent or not mainGui:IsDescendantOf(game) then
+                                CleanupMainGuiHooks()
+                            end
+                        end)
+
+                        if mainGuiAncConn then
+                            State.RegisterConnection(mainGuiAncConn)
                         end
                     end
 
@@ -2122,17 +2210,7 @@ do
                 GameUiTracker.SetupBagParser()
                 GameUiTracker.SetupInventoryTokensWatcher()
                 State.RegisterCleanup(function()
-                    for _, conns in pairs(BagConnections)do
-                        for _, c in ipairs(conns)do
-                            if c and c.Connected then
-                                pcall(function()
-                                    c:Disconnect()
-                                end)
-                            end
-                        end
-                    end
-
-                    table.clear(BagConnections)
+                    CleanupMainGuiHooks()
 
                     if tokensChangedConn then
                         pcall(function()
@@ -2827,7 +2905,10 @@ do
                     end
 
                     checkScreens()
-                    State.RegisterConnection(playerGui.ChildAdded:Connect(function(
+
+                    local childAddedConn: RBXScriptConnection? = nil
+
+                    childAddedConn = playerGui.ChildAdded:Connect(function(
                         child
                     )
                         if child.Name == 'DeviceSelect' then
@@ -2837,7 +2918,12 @@ do
                             task.wait(0.05)
                             DismissJoinPrompt(child)
                         end
-                    end))
+                    end)
+
+                    if childAddedConn then
+                        State.RegisterConnection(childAddedConn)
+                    end
+
                     task.spawn(function()
                         local watchStart = os.clock()
 
@@ -2850,6 +2936,17 @@ do
                             task.wait(0.5)
                         end
 
+                        if childAddedConn then
+                            if childAddedConn.Connected then
+                                pcall(function()
+                                    childAddedConn:Disconnect()
+                                end)
+                            end
+
+                            childAddedConn = nil
+
+                            State.PruneActiveConnections()
+                        end
                         if not StartupBypass.CheckAnyStartupScreens() then
                             State.InitialBypassActive = false
 
@@ -4157,6 +4254,7 @@ do
             local Gui = {}
             local CloseBtnRef: TextButton? = nil
             local dragEndConn: RBXScriptConnection? = nil
+            local dragRenderConn: RBXScriptConnection? = nil
 
             function Gui.BindClick(guiElement: GuiButton, callback: () -> ())
                 local lastFire = 0
@@ -4395,29 +4493,44 @@ do
                 local dragStart: Vector3? = nil
                 local startPos: UDim2? = nil
 
+                local function stopDragging()
+                    dragging = false
+                    dragInput = nil
+                    dragStart = nil
+                    startPos = nil
+
+                    if dragEndConn then
+                        dragEndConn:Disconnect()
+
+                        dragEndConn = nil
+                    end
+                    if dragRenderConn then
+                        dragRenderConn:Disconnect()
+
+                        dragRenderConn = nil
+                    end
+                end
+
                 State.RegisterConnection(TitleBar.InputBegan:Connect(function(
                     input
                 )
                     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                        stopDragging()
+
                         dragging = true
                         dragStart = input.Position
                         startPos = MainFrame.Position
-
-                        if dragEndConn then
-                            dragEndConn:Disconnect()
-
-                            dragEndConn = nil
-                        end
-
                         dragEndConn = input.Changed:Connect(function()
                             if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
-                                dragging = false
+                                stopDragging()
+                            end
+                        end)
+                        dragRenderConn = RunService.RenderStepped:Connect(function(
+                        )
+                            if dragging and dragInput and dragStart and startPos and not State.IsTerminated then
+                                local delta = dragInput.Position - dragStart
 
-                                if dragEndConn then
-                                    dragEndConn:Disconnect()
-
-                                    dragEndConn = nil
-                                end
+                                MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
                             end
                         end)
                     end
@@ -4425,16 +4538,8 @@ do
                 State.RegisterConnection(TitleBar.InputChanged:Connect(function(
                     input
                 )
-                    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+                    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
                         dragInput = input
-                    end
-                end))
-                State.RegisterConnection(RunService.RenderStepped:Connect(function(
-                )
-                    if dragging and dragInput and dragStart and startPos and not State.IsTerminated then
-                        local delta = dragInput.Position - dragStart
-
-                        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
                     end
                 end))
 
@@ -5246,6 +5351,13 @@ do
                         end)
 
                         dragEndConn = nil
+                    end
+                    if dragRenderConn then
+                        pcall(function()
+                            dragRenderConn:Disconnect()
+                        end)
+
+                        dragRenderConn = nil
                     end
 
                     CloseBtnRef = nil
@@ -6182,6 +6294,8 @@ do
                     AutoFarm.AutoFarmCleanUp()
 
                     State.BagIsFull = false
+
+                    State.PruneActiveConnections()
 
                     if Network.RoundInProgress() then
                         State.ChangeState(State.WaitingForRoundEnd)
