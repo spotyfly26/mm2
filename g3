@@ -421,7 +421,7 @@ do
 
                     if decodeOk and typeof(data) == 'table' then
                         local myJobId = tostring(game.JobId or '')
-                        local sameServer = (myJobId == '' or data.jobId == '' or data.jobId == myJobId)
+                        local sameServer = (myJobId ~= '' and data.jobId == myJobId)
                         local fresh = (typeof(data.ts) == 'number' and math.abs(os.time() - data.ts) <= SYNC_TTL_SECONDS)
 
                         if sameServer and fresh then
@@ -5314,14 +5314,32 @@ do
             local rt = State.rt
             local AutoFarm = {}
             local twinMotionCache: {[string]: TwinMotionEntry__DARKLUA_TYPE_a} = {}
+            local hasPublishedActiveSync = false
 
+            local function HasAnyTwinInServer(): boolean
+                for _, plr in ipairs(Players:GetPlayers())do
+                    if plr ~= LocalPlayer and Network.IsTwinPlayer(plr, plr.Name) then
+                        return true
+                    end
+                end
+
+                return false
+            end
             local function PublishTwinSync(
                 farming: boolean,
                 targetPos: Vector3?,
                 nextPos: Vector3?
             )
-                if SETTINGS.GameMode == 'Twin' or Network.HasTwinsConfigured() then
-                    Config.WriteTwinSync(farming, State.BagIsFull, targetPos, nextPos)
+                if farming then
+                    if SETTINGS.TwinAvoidEnabled and Network.HasTwinsConfigured() and HasAnyTwinInServer() then
+                        Config.WriteTwinSync(true, State.BagIsFull, targetPos, nextPos)
+
+                        hasPublishedActiveSync = true
+                    end
+                elseif hasPublishedActiveSync then
+                    Config.WriteTwinSync(false, State.BagIsFull, nil, nil)
+
+                    hasPublishedActiveSync = false
                 end
             end
 
