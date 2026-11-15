@@ -6443,7 +6443,7 @@ do
                                 end
                                 if padPart then
                                     local halfHeight = (padPart.Size.Y > 1) and (padPart.Size.Y * 0.5) or 2.5
-                                    local targetPos = padPart.Position - Vector3.new(0, halfHeight - 2.7, 0)
+                                    local targetPos = padPart.Position - Vector3.new(0, halfHeight - 3, 0)
                                     local padLook = padPart.CFrame.LookVector
                                     local flatLook = Vector3.new(padLook.X, 0, padLook.Z)
                                     local baseCFrame = (flatLook.Magnitude > 0.01) and CFrame.new(targetPos, targetPos + flatLook) or CFrame.new(targetPos)
@@ -6595,16 +6595,19 @@ do
                                 voteCount = voteCount + 1
 
                                 State.UpdateStatus(string.format('\u{413}\u{43e}\u{43b}\u{43e}\u{441}: [%s] (%d/%d)', bestMap, voteCount, maxVotes), Color3.fromRGB(50, 255, 255))
-                                task.wait(0.15)
+                                task.wait(0.1)
 
-                                if not SETTINGS.VoteSpamEnabled or voteCount >= maxVotes or MapTracker.CheckIfGameInProgress() or not SETTINGS.AutoVoteEnabled then
-                                    break
-                                end
                                 if holdV and holdV.Parent then
                                     holdV:Destroy()
                                 end
                                 if holdG and holdG.Parent then
                                     holdG:Destroy()
+                                end
+                                if currentHum then
+                                    currentHum.PlatformStand = false
+                                end
+                                if MapTracker.CheckIfGameInProgress() or State.IsTerminated then
+                                    break
                                 end
 
                                 pcall(function()
@@ -6613,33 +6616,16 @@ do
                                     currentChar:BreakJoints()
                                 end)
 
+                                if not SETTINGS.VoteSpamEnabled or voteCount >= maxVotes or not SETTINGS.AutoVoteEnabled then
+                                    break
+                                end
+
                                 currentChar = LocalPlayer.CharacterAdded:Wait()
                                 currentHrp = (currentChar:WaitForChild('HumanoidRootPart', 5) or currentChar.PrimaryPart)::BasePart?
                                 currentHum = currentChar:WaitForChild('Humanoid', 5)::Humanoid?
                             end
 
                             State.HasVoted = true
-
-                            State.UpdateStatus(string.format('\u{413}\u{43e}\u{43b}\u{43e}\u{441}: \u{41e}\u{442}\u{434}\u{430}\u{43d} (%d \u{437}\u{430} %s). \u{41e}\u{436}\u{438}\u{434}\u{430}\u{43d}\u{438}\u{435} \u{440}\u{430}\u{443}\u{43d}\u{434}\u{430}...', voteCount, bestMap), Color3.fromRGB(100, 255, 100))
-
-                            while not State.IsTerminated and SETTINGS.AutoVoteEnabled and not MapTracker.CheckIfGameInProgress() do
-                                if currentChar and currentHrp and currentHum and currentHum.Health > 0 then
-                                    currentHum.PlatformStand = true
-                                    currentHrp.AssemblyLinearVelocity = Vector3.zero
-                                    currentHrp.AssemblyAngularVelocity = Vector3.zero
-
-                                    local holdG = currentHrp:FindFirstChild('VoteGyro')::BodyGyro?
-
-                                    if holdG then
-                                        holdG.CFrame = bestCFrame
-                                    end
-                                else
-                                    break
-                                end
-
-                                task.wait(0.25)
-                            end
-
                             State.isVotingNoclip = false
 
                             if currentHrp then
