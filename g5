@@ -537,8 +537,8 @@ do
                 TwinAvoidEnabled = true,
                 TwinAvoidRadius = 30,
                 UnderfloorOffset = 3.8,
-                SafeUnderfloorY = 200,
-                SafeZoneMargin = 15,
+                SafeUnderfloorY = 500,
+                SafeZoneMargin = 1,
                 AutoRejoinEnabled = false,
                 RejoinTime = 5400,
                 RejoinServerMode = 'Same',
@@ -6443,7 +6443,7 @@ do
                                 end
                                 if padPart then
                                     local halfHeight = (padPart.Size.Y > 1) and (padPart.Size.Y * 0.5) or 2.5
-                                    local targetPos = padPart.Position - Vector3.new(0, halfHeight - 0.7, 0)
+                                    local targetPos = padPart.Position - Vector3.new(0, halfHeight + 0.7, 0)
                                     local padLook = padPart.CFrame.LookVector
                                     local flatLook = Vector3.new(padLook.X, 0, padLook.Z)
                                     local baseCFrame = (flatLook.Magnitude > 0.01) and CFrame.new(targetPos, targetPos + flatLook) or CFrame.new(targetPos)
