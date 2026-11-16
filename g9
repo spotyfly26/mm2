@@ -6595,7 +6595,7 @@ do
                                 voteCount = voteCount + 1
 
                                 State.UpdateStatus(string.format('\u{413}\u{43e}\u{43b}\u{43e}\u{441}: [%s] (%d/%d)', bestMap, voteCount, maxVotes), Color3.fromRGB(50, 255, 255))
-                                task.wait(0.17)
+                                task.wait(0.3)
 
                                 if holdV and holdV.Parent then
                                     holdV:Destroy()
