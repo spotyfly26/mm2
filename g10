@@ -1,6 +1,5 @@
 --!nocheck
-type TwinMotionEntry__DARKLUA_TYPE_a = {lastDir: Vector3?, lastSpeed: number, lastMoveClock: number, anchorPos: Vector3, stationarySince: number}
-type ActiveTwinData__DARKLUA_TYPE_b = {plr: Player, pos: Vector3, predPos: Vector3?, claimedTarget: Vector3?, nextTarget: Vector3?, anchorPos: Vector3, isMeLeaderOverTwin: boolean}
+type MapSectorData__DARKLUA_TYPE_a = {centerX: number, centerZ: number, axisX: number, axisZ: number, projections: {number}}
 
 local __DARKLUA_BUNDLE_MODULES = {
     cache = {}::any,
@@ -265,202 +264,6 @@ do
                 end
 
                 return false
-            end
-
-            local SYNC_TTL_SECONDS = 8
-            local SYNC_READ_INTERVAL = 0.25
-            local SYNC_HEARTBEAT_INTERVAL = 3
-            local twinSyncReadCache: {[string]: {data: {[string]: any}?, readAt: number}} = {}
-            local lastWrittenSyncJson = ''
-            local lastWrittenSyncAt = 0
-
-            function Config.GetSyncFile(
-                playerName: string?,
-                useFolder: boolean?
-            ): string
-                local safeLower = string.lower(Config.SanitizeFileName(playerName))
-                local fileName = safeLower .. '_sync.json'
-
-                if useFolder == false then
-                    return fileName
-                end
-
-                return Config.CONFIG_FOLDER .. '/' .. fileName
-            end
-
-            local function RoundCoord(n: number): number
-                return math.floor(n * 10 + 0.5) / 10
-            end
-
-            function Config.WriteTwinSync(
-                farming: boolean,
-                bagFull: boolean,
-                targetPos: Vector3?,
-                nextPos: Vector3?
-            ): boolean
-                local wf = writefile or (syn and syn.writefile)
-
-                if typeof(wf) ~= 'function' then
-                    return false
-                end
-
-                local lp = Players.LocalPlayer
-
-                if not lp then
-                    return false
-                end
-
-                local payload: {[string]: any} = {
-                    jobId = tostring(game.JobId or ''),
-                    farming = (farming == true),
-                    bagFull = (bagFull == true),
-                }
-
-                if targetPos then
-                    payload.tx = RoundCoord(targetPos.X)
-                    payload.ty = RoundCoord(targetPos.Y)
-                    payload.tz = RoundCoord(targetPos.Z)
-                end
-                if nextPos then
-                    payload.nx = RoundCoord(nextPos.X)
-                    payload.ny = RoundCoord(nextPos.Y)
-                    payload.nz = RoundCoord(nextPos.Z)
-                end
-
-                local stateKeyOk, stateKey = pcall(function()
-                    return HttpService:JSONEncode(payload)
-                end)
-
-                if not stateKeyOk or typeof(stateKey) ~= 'string' then
-                    return false
-                end
-
-                local nowClock = os.clock()
-
-                if stateKey == lastWrittenSyncJson and (nowClock - lastWrittenSyncAt) < SYNC_HEARTBEAT_INTERVAL then
-                    return true
-                end
-
-                payload.ts = os.time()
-
-                local encodeOk, jsonStr = pcall(function()
-                    return HttpService:JSONEncode(payload)
-                end)
-
-                if not encodeOk or typeof(jsonStr) ~= 'string' then
-                    return false
-                end
-
-                local hasFolder = Config.EnsureConfigFolder()
-                local savePath = Config.GetSyncFile(lp.Name, hasFolder)
-                local writeOk = pcall(wf, savePath, jsonStr)
-
-                if writeOk then
-                    lastWrittenSyncJson = stateKey
-                    lastWrittenSyncAt = nowClock
-                end
-
-                return writeOk
-            end
-            function Config.ReadTwinSync(twinName: string): {[string]: any}?
-                if not twinName or twinName == '' then
-                    return nil
-                end
-
-                local key = string.lower(Config.SanitizeFileName(twinName))
-                local nowClock = os.clock()
-                local cachedEntry = twinSyncReadCache[key]
-
-                if cachedEntry and (nowClock - cachedEntry.readAt) < SYNC_READ_INTERVAL then
-                    local d = cachedEntry.data
-
-                    if d and typeof(d.ts) == 'number' and math.abs(os.time() - d.ts) <= SYNC_TTL_SECONDS then
-                        return d
-                    end
-
-                    return nil
-                end
-
-                local rf = readfile or (syn and syn.readfile)
-                local isf = isfile or (syn and syn.isfile)
-
-                if typeof(isf) ~= 'function' or typeof(rf) ~= 'function' then
-                    return nil
-                end
-
-                local targetFile: string? = nil
-
-                for _, candidate in ipairs({
-                    Config.GetSyncFile(key, true),
-                    Config.GetSyncFile(key, false),
-                })do
-                    local ok, exists = pcall(isf, candidate)
-
-                    if ok and exists then
-                        targetFile = candidate
-
-                        break
-                    end
-                end
-
-                if not targetFile then
-                    twinSyncReadCache[key] = {
-                        data = nil,
-                        readAt = nowClock,
-                    }
-
-                    return nil
-                end
-
-                local readOk, content = pcall(rf, targetFile)
-
-                if readOk and typeof(content) == 'string' and content ~= '' then
-                    local decodeOk, data = pcall(function()
-                        return HttpService:JSONDecode(content)
-                    end)
-
-                    if decodeOk and typeof(data) == 'table' then
-                        local myJobId = tostring(game.JobId or '')
-                        local sameServer = (myJobId ~= '' and data.jobId == myJobId)
-                        local fresh = (typeof(data.ts) == 'number' and math.abs(os.time() - data.ts) <= SYNC_TTL_SECONDS)
-
-                        if sameServer and fresh then
-                            twinSyncReadCache[key] = {
-                                data = data,
-                                readAt = nowClock,
-                            }
-
-                            return data
-                        else
-                            twinSyncReadCache[key] = {
-                                data = nil,
-                                readAt = nowClock,
-                            }
-
-                            return nil
-                        end
-                    end
-                end
-                if cachedEntry and cachedEntry.data and typeof(cachedEntry.data.ts) == 'number' then
-                    if math.abs(os.time() - cachedEntry.data.ts) <= SYNC_TTL_SECONDS then
-                        cachedEntry.readAt = nowClock
-
-                        return cachedEntry.data
-                    end
-                end
-
-                twinSyncReadCache[key] = {
-                    data = nil,
-                    readAt = nowClock,
-                }
-
-                return nil
-            end
-            function Config.ClearTwinSyncCache()
-                table.clear(twinSyncReadCache)
-
-                lastWrittenSyncJson = ''
-                lastWrittenSyncAt = 0
             end
 
             return Config
@@ -832,6 +635,9 @@ do
             local CurrentMapInstance: Instance? = nil
             local CurrentMapSpawnPosition: Vector3? = nil
             local CurrentMapSafeY: number? = nil
+            local CurrentMapSector: MapSectorData__DARKLUA_TYPE_a? = nil
+            local DONE_PARK_OFFSET = 45
+            local DONE_DETECT_OFFSET = 25
             local CurrentMapCcConn: RBXScriptConnection? = nil
             local CurrentMapRemConn: RBXScriptConnection? = nil
             local candidateConnections: {[Instance]: {RBXScriptConnection}} = setmetatable({}, {
@@ -1064,6 +870,7 @@ do
                     CurrentMapInstance = nil
                     CurrentMapSpawnPosition = nil
                     CurrentMapSafeY = nil
+                    CurrentMapSector = nil
 
                     MapTracker.ResetSafeZoneState()
 
@@ -1109,6 +916,147 @@ do
                 return nil
             end
 
+            local function ComputeMapSector(mapModel: Instance): MapSectorData__DARKLUA_TYPE_a?
+                local spawns = mapModel:FindFirstChild('Spawns')
+
+                if not spawns then
+                    return nil
+                end
+
+                local points: {{x: number, z: number}} = {}
+
+                local function addPart(part: BasePart)
+                    local p = part.Position
+
+                    if p.X == p.X and p.Z == p.Z then
+                        local qx = math.floor(p.X * 10 + 0.5) / 10
+                        local qz = math.floor(p.Z * 10 + 0.5) / 10
+
+                        table.insert(points, {
+                            x = qx,
+                            z = qz,
+                        })
+                    end
+                end
+
+                if spawns:IsA('BasePart') then
+                    addPart(spawns)
+                end
+
+                for _, desc in ipairs(spawns:GetDescendants())do
+                    if desc:IsA('BasePart') then
+                        addPart(desc)
+                    end
+                end
+
+                if #points < 2 then
+                    return nil
+                end
+
+                table.sort(points, function(a, b)
+                    if a.x ~= b.x then
+                        return a.x < b.x
+                    end
+
+                    return a.z < b.z
+                end)
+
+                local unique: {{x: number, z: number}} = {}
+
+                for _, pt in ipairs(points)do
+                    local prev = unique[#unique]
+
+                    if not prev or math.abs(pt.x - prev.x) > 0.05 or math.abs(pt.z - prev.z) > 0.05 then
+                        table.insert(unique, pt)
+                    end
+                end
+
+                local n = #unique
+
+                if n < 2 then
+                    return nil
+                end
+
+                local sumX, sumZ = 0, 0
+
+                for _, pt in ipairs(unique)do
+                    sumX = sumX + pt.x
+                    sumZ = sumZ + pt.z
+                end
+
+                local cx = sumX / n
+                local cz = sumZ / n
+                local cxx, czz, cxz = 0, 0, 0
+
+                for _, pt in ipairs(unique)do
+                    local dx = pt.x - cx
+                    local dz = pt.z - cz
+
+                    cxx = cxx + dx * dx
+                    czz = czz + dz * dz
+                    cxz = cxz + dx * dz
+                end
+
+                local ax, az = 1, 0
+                local diff = cxx - czz
+
+                if math.abs(cxz) > 1e-4 then
+                    local disc = math.sqrt(diff * diff + 4 * cxz * cxz)
+                    local vx, vz
+
+                    if diff >= 0 then
+                        vx = 0.5 * (diff + disc)
+                        vz = cxz
+                    else
+                        vx = cxz
+                        vz = 0.5 * (-diff + disc)
+                    end
+
+                    local len = math.sqrt(vx * vx + vz * vz)
+
+                    if len > 1e-6 then
+                        ax = vx / len
+                        az = vz / len
+                    end
+                elseif czz > cxx + 1e-4 then
+                    ax, az = 0, 1
+                end
+                if ax < -1e-4 or (math.abs(ax) <= 1e-4 and az < 0) then
+                    ax, az = -ax, -az
+                end
+
+                local projections: {number} = table.create(n)
+
+                for i = 1, n do
+                    local pt = unique[i]
+
+                    projections[i] = (pt.x - cx) * ax + (pt.z - cz) * az
+                end
+
+                table.sort(projections)
+
+                return {
+                    centerX = cx,
+                    centerZ = cz,
+                    axisX = ax,
+                    axisZ = az,
+                    projections = projections,
+                }
+            end
+
+            function MapTracker.GetMapSector(): MapSectorData__DARKLUA_TYPE_a?
+                if CurrentMapSector then
+                    return CurrentMapSector
+                end
+                if not CurrentMapInstance or CurrentMapInstance.Parent ~= Workspace then
+                    return nil
+                end
+
+                CurrentMapSector = ComputeMapSector(CurrentMapInstance)
+
+                return CurrentMapSector
+            end
+
             local function ComputeMapSafeY(map: Instance): number?
                 local minY: number? = nil
 
@@ -1147,10 +1095,21 @@ do
                 local y = minY - (SETTINGS.SafeZoneMargin or 15)
 
                 y = math.max(y, spawnY - 300)
-                y = math.max(y, Workspace.FallenPartsDestroyHeight + 50)
+                y = math.max(y, Workspace.FallenPartsDestroyHeight + 100)
 
                 return y
             end
+
+            function MapTracker.GetSafeZoneY(): number
+                return CurrentMapSafeY or (CurrentMapSpawnPosition and (CurrentMapSpawnPosition.Y - 20)) or SETTINGS.SafeUnderfloorY or 200
+            end
+            function MapTracker.GetDoneParkY(): number
+                return math.max(MapTracker.GetSafeZoneY() - DONE_PARK_OFFSET, Workspace.FallenPartsDestroyHeight + 55)
+            end
+            function MapTracker.GetDoneDetectY(): number
+                return math.max(MapTracker.GetSafeZoneY() - DONE_DETECT_OFFSET, Workspace.FallenPartsDestroyHeight + 75)
+            end
+
             local function StartSafeZoneWatch()
                 if safeZoneTaskRunning or safeZoneDone or State.IsTerminated or not SETTINGS.AutoFarmEnabled then
                     return
@@ -1247,6 +1206,7 @@ do
                 DisconnectCurrentMapListeners()
 
                 CurrentMapInstance = child
+                CurrentMapSector = nil
 
                 DisconnectCandidate(child)
                 State.PruneActiveConnections()
@@ -1482,6 +1442,7 @@ do
                     CurrentMapInstance = nil
                     CurrentMapSpawnPosition = nil
                     CurrentMapSafeY = nil
+                    CurrentMapSector = nil
 
                     MapTracker.ResetSafeZoneState()
                 end)
@@ -5412,7 +5373,6 @@ do
     end
     do
         local function __modImpl()
-            local Config = __DARKLUA_BUNDLE_MODULES.a()
             local State = __DARKLUA_BUNDLE_MODULES.b()
             local MapTracker = __DARKLUA_BUNDLE_MODULES.c()
             local Network = __DARKLUA_BUNDLE_MODULES.e()
@@ -5425,42 +5385,30 @@ do
             local SETTINGS = State.SETTINGS
             local rt = State.rt
             local AutoFarm = {}
-            local twinMotionCache: {[string]: TwinMotionEntry__DARKLUA_TYPE_a} = {}
-            local hasPublishedActiveSync = false
+            local TWIN_AFK_TIMEOUT = 6.5
+            local twinMotion: {[string]: {anchorX: number, anchorY: number, anchorZ: number, stationarySince: number}} = {}
+            local activeTwinPosX: {number} = {}
+            local activeTwinPosY: {number} = {}
+            local activeTwinPosZ: {number} = {}
+            local activeTwinVelX: {number} = {}
+            local activeTwinVelZ: {number} = {}
+            local activeAllyIds: {number} = {}
 
-            local function HasAnyTwinInServer(): boolean
-                for _, plr in ipairs(Players:GetPlayers())do
-                    if plr ~= LocalPlayer and Network.IsTwinPlayer(plr, plr.Name) then
-                        return true
-                    end
-                end
-
-                return false
-            end
-            local function PublishTwinSync(
-                farming: boolean,
-                targetPos: Vector3?,
-                nextPos: Vector3?
-            )
-                if farming then
-                    if SETTINGS.TwinAvoidEnabled and Network.HasTwinsConfigured() and HasAnyTwinInServer() then
-                        Config.WriteTwinSync(true, State.BagIsFull, targetPos, nextPos)
-
-                        hasPublishedActiveSync = true
-                    end
-                elseif hasPublishedActiveSync then
-                    Config.WriteTwinSync(false, State.BagIsFull, nil, nil)
-
-                    hasPublishedActiveSync = false
-                end
+            local function ClearTwinStateBuffers()
+                table.clear(twinMotion)
+                table.clear(activeTwinPosX)
+                table.clear(activeTwinPosY)
+                table.clear(activeTwinPosZ)
+                table.clear(activeTwinVelX)
+                table.clear(activeTwinVelZ)
+                table.clear(activeAllyIds)
             end
 
             function AutoFarm.AutoFarmCleanUp()
                 table.clear(rt.touchedCoins)
                 table.clear(rt.cachedCoins)
                 table.clear(rt.cachedBodyParts)
-                table.clear(twinMotionCache)
-                PublishTwinSync(false, nil, nil)
+                ClearTwinStateBuffers()
                 State.DisconnectCharDescConn()
 
                 if rt.Added then
@@ -5569,15 +5517,28 @@ do
                 end)
             end
 
-            local function GetActiveTwinsInfo(): ({ActiveTwinData__DARKLUA_TYPE_b},boolean)
-                local activeTwins: {ActiveTwinData__DARKLUA_TYPE_b} = {}
-                local isOverallLeader = true
+            local function CountAliveEnemies(): number
+                local count = 0
 
-                if not SETTINGS.TwinAvoidEnabled or not Network.HasTwinsConfigured() then
-                    return activeTwins, true
+                for _, plr in ipairs(Players:GetPlayers())do
+                    if plr ~= LocalPlayer and not Network.IsTwinPlayer(plr, plr.Name) and Network.IsPlayerActuallyAlive(plr) then
+                        count = count + 1
+                    end
                 end
 
-                local myNameLower = string.lower(LocalPlayer.Name)
+                return count
+            end
+            local function RefreshTwinState(hasCoinsOnMap: boolean): (number,number,number,number,boolean)
+                table.clear(activeAllyIds)
+
+                if not SETTINGS.TwinAvoidEnabled or not Network.HasTwinsConfigured() then
+                    return 1, 1, 0, 0, true
+                end
+
+                local activeCount = 0
+                local doneCount = 0
+                local isHighestDoneUserId = true
+                local doneDetectY = MapTracker.GetDoneDetectY()
                 local nowClock = os.clock()
 
                 for _, plr in ipairs(Players:GetPlayers())do
@@ -5585,202 +5546,236 @@ do
                         local tChar = plr.Character
                         local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild('HumanoidRootPart') or tChar:FindFirstChildWhichIsA('BasePart'))
 
-                        if tHrp then
-                            local sync = Config.ReadTwinSync(plr.Name)
+                        if tHrp and tHrp:IsA('BasePart') then
+                            local tPos = tHrp.Position
 
-                            if sync and (sync.bagFull == true or sync.farming == false) then
+                            if tPos.Y <= doneDetectY then
+                                doneCount = doneCount + 1
+
+                                if plr.UserId > LocalPlayer.UserId or (plr.UserId == LocalPlayer.UserId and plr.Name > LocalPlayer.Name) then
+                                    isHighestDoneUserId = false
+                                end
+
                                 continue
                             end
 
-                            local tPos = tHrp.Position
                             local vel = tHrp.AssemblyLinearVelocity
-                            local speed = vel and vel.Magnitude or 0
-                            local mEntry = twinMotionCache[plr.Name]
+                            local vx = vel and vel.X or 0
+                            local vy = vel and vel.Y or 0
+                            local vz = vel and vel.Z or 0
+                            local speedSq = vx * vx + vy * vy + vz * vz
+                            local mEntry = twinMotion[plr.Name]
 
                             if not mEntry then
-                                mEntry = {
-                                    lastDir = nil,
-                                    lastSpeed = 0,
-                                    lastMoveClock = nowClock,
-                                    anchorPos = tPos,
+                                twinMotion[plr.Name] = {
+                                    anchorX = tPos.X,
+                                    anchorY = tPos.Y,
+                                    anchorZ = tPos.Z,
                                     stationarySince = nowClock,
                                 }
-                                twinMotionCache[plr.Name] = mEntry
                             else
-                                if (tPos - mEntry.anchorPos).Magnitude > 1.8 or speed > 2.5 then
-                                    mEntry.anchorPos = tPos
+                                local dx = tPos.X - mEntry.anchorX
+                                local dy = tPos.Y - mEntry.anchorY
+                                local dz = tPos.Z - mEntry.anchorZ
+
+                                if (dx * dx + dy * dy + dz * dz) > 2.25 or speedSq > 6.25 or not hasCoinsOnMap then
+                                    mEntry.anchorX = tPos.X
+                                    mEntry.anchorY = tPos.Y
+                                    mEntry.anchorZ = tPos.Z
                                     mEntry.stationarySince = nowClock
-                                end
-                                if speed > 3 then
-                                    mEntry.lastDir = vel.Unit
-                                    mEntry.lastSpeed = speed
-                                    mEntry.lastMoveClock = nowClock
-                                end
-                            end
-                            if not sync and (nowClock - mEntry.stationarySince) > 3.5 then
-                                continue
-                            end
-
-                            local claimedTarget: Vector3? = nil
-                            local nextTarget: Vector3? = nil
-
-                            if sync then
-                                if typeof(sync.tx) == 'number' and typeof(sync.ty) == 'number' and typeof(sync.tz) == 'number' then
-                                    claimedTarget = Vector3.new(sync.tx, sync.ty, sync.tz)
-                                end
-                                if typeof(sync.nx) == 'number' and typeof(sync.ny) == 'number' and typeof(sync.nz) == 'number' then
-                                    nextTarget = Vector3.new(sync.nx, sync.ny, sync.nz)
+                                elseif (nowClock - mEntry.stationarySince) > TWIN_AFK_TIMEOUT then
+                                    continue
                                 end
                             end
 
-                            local predPos: Vector3? = nil
+                            activeCount = activeCount + 1
+                            activeTwinPosX[activeCount] = tPos.X
+                            activeTwinPosY[activeCount] = tPos.Y
+                            activeTwinPosZ[activeCount] = tPos.Z
+                            activeTwinVelX[activeCount] = vx
+                            activeTwinVelZ[activeCount] = vz
 
-                            if speed > 3 then
-                                predPos = tPos + (vel.Unit * math.min(speed * 1.8, 50))
-                            elseif mEntry.lastDir and (nowClock - mEntry.lastMoveClock) < 0.45 then
-                                predPos = tPos + (mEntry.lastDir * math.min(mEntry.lastSpeed * 1.3, 38))
-                            elseif claimedTarget then
-                                predPos = claimedTarget
-                            end
-
-                            local twinNameLower = string.lower(plr.Name)
-                            local meLeaderOverThis = (myNameLower < twinNameLower)
-
-                            if not meLeaderOverThis then
-                                isOverallLeader = false
-                            end
-
-                            table.insert(activeTwins, {
-                                plr = plr,
-                                pos = tPos,
-                                predPos = predPos,
-                                claimedTarget = claimedTarget,
-                                nextTarget = nextTarget,
-                                anchorPos = claimedTarget or tPos,
-                                isMeLeaderOverTwin = meLeaderOverThis,
-                            })
+                            table.insert(activeAllyIds, plr.UserId)
                         end
                     end
                 end
 
-                return activeTwins, isOverallLeader
+                if activeCount == 0 then
+                    return 1, 1, 0, doneCount, isHighestDoneUserId
+                end
+
+                table.insert(activeAllyIds, LocalPlayer.UserId)
+                table.sort(activeAllyIds)
+
+                local totalSlots = #activeAllyIds
+                local mySlot = 1
+
+                for idx = 1, totalSlots do
+                    if activeAllyIds[idx] == LocalPlayer.UserId then
+                        mySlot = idx
+
+                        break
+                    end
+                end
+
+                return mySlot, totalSlots, activeCount, doneCount, isHighestDoneUserId
+            end
+            local function GetQuantile(sorted: {number}, t: number): number
+                local count = #sorted
+
+                if count == 0 then
+                    return 0
+                end
+                if count == 1 then
+                    return sorted[1]
+                end
+
+                local pos = 1 + (count - 1) * math.clamp(t, 0, 1)
+                local lo = math.floor(pos)
+                local hi = math.ceil(pos)
+
+                if lo == hi then
+                    return sorted[lo]
+                end
+
+                return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo)
+            end
+            local function CanBorrowOtherSectorCoin(
+                cx: number,
+                cy: number,
+                cz: number,
+                myDistSq: number,
+                activeTwinCount: number
+            ): boolean
+                for i = 1, activeTwinCount do
+                    local tdx = cx - activeTwinPosX[i]
+                    local tdy = cy - activeTwinPosY[i]
+                    local tdz = cz - activeTwinPosZ[i]
+                    local twinDistSq = tdx * tdx + tdy * tdy + tdz * tdz
+
+                    if twinDistSq <= 1024 or myDistSq >= twinDistSq then
+                        return false
+                    end
+
+                    local vx = activeTwinVelX[i]
+                    local vz = activeTwinVelZ[i]
+                    local velSq = vx * vx + vz * vz
+
+                    if velSq > 9 then
+                        local dot = tdx * vx + tdz * vz
+
+                        if dot > 0 then
+                            local horizDistSq = tdx * tdx + tdz * tdz
+
+                            if dot * dot <= 2025 * velSq and dot * dot >= 0.36 * horizDistSq * velSq then
+                                return false
+                            end
+                        end
+                    end
+                end
+
+                return true
             end
 
-            function AutoFarm.GetNearestCoin(isFirstCoin: boolean?): (Instance?,Vector3?)
+            function AutoFarm.GetNearestCoin(isFirstCoin: boolean?): (Instance?,boolean)
                 local char = rt:Character()
 
                 if not char or not char.PrimaryPart then
-                    return nil, nil
+                    return nil, false
                 end
 
                 local myPos = char.PrimaryPart.Position
-                local activeTwins, isOverallLeader = GetActiveTwinsInfo()
-                local hasActiveTwins = (#activeTwins > 0)
-                local bestCoin: Instance? = nil
-                local bestScore = (isFirstCoin and hasActiveTwins and not isOverallLeader) and 
--math.huge or math.huge
-                local secondBestPos: Vector3? = nil
-                local secondBestDist = math.huge
-                local fallbackCoin: Instance? = nil
-                local fallbackDist = math.huge
-                local claimedFallbackCoin: Instance? = nil
-                local claimedFallbackDist = math.huge
-                local avoidRadius = SETTINGS.TwinAvoidRadius or 30
+                local myX, myY, myZ = myPos.X, myPos.Y, myPos.Z
+                local mySlot, totalSlots, activeTwinCount = RefreshTwinState(next(rt.cachedCoins) ~= nil)
+                local sector = (totalSlots > 1) and MapTracker.GetMapSector() or nil
+                local minProj = -math.huge
+                local maxProj = math.huge
+                local firstCoinTargetProj = 0
+
+                if sector then
+                    if mySlot > 1 then
+                        minProj = GetQuantile(sector.projections, (mySlot - 1) / totalSlots)
+                    end
+                    if mySlot < totalSlots then
+                        maxProj = GetQuantile(sector.projections, mySlot / totalSlots)
+                    end
+                    if isFirstCoin then
+                        firstCoinTargetProj = GetQuantile(sector.projections, (mySlot - 0.5) / totalSlots)
+                    end
+                end
+
+                local bestOwnCoin: Instance? = nil
+                local bestOwnScore = math.huge
+                local bestBorrowCoin: Instance? = nil
+                local bestBorrowDistSq = math.huge
+                local otherCoinCount = 0
 
                 for coin, _ in pairs(rt.cachedCoins)do
                     if coin and coin.Parent and not isCoinTouched(coin) and coin:FindFirstChildWhichIsA('TouchTransmitter') then
                         local coinPos = (coin::BasePart).Position
-                        local myDist = (coinPos - myPos).Magnitude
-                        local isHardClaimedByTwin = false
+                        local cx, cy, cz = coinPos.X, coinPos.Y, coinPos.Z
+                        local dx, dy, dz = cx - myX, cy - myY, cz - myZ
+                        local myDistSq = dx * dx + dy * dy + dz * dz
 
-                        if hasActiveTwins then
-                            for _, twin in ipairs(activeTwins)do
-                                if twin.claimedTarget and (coinPos - twin.claimedTarget).Magnitude < 4.5 then
-                                    local twinDistToClaim = (coinPos - twin.pos).Magnitude
+                        if totalSlots == 1 then
+                            if myDistSq < bestOwnScore then
+                                bestOwnScore = myDistSq
+                                bestOwnCoin = coin
+                            end
+                        elseif sector then
+                            local proj = (cx - sector.centerX) * sector.axisX + (cz - sector.centerZ) * sector.axisZ
+                            local inMySector: boolean
 
-                                    if not (myDist + 4 < twinDistToClaim and twin.isMeLeaderOverTwin) then
-                                        isHardClaimedByTwin = true
+                            if mySlot == 1 then
+                                inMySector = (proj <= maxProj)
+                            elseif mySlot == totalSlots then
+                                inMySector = (proj > minProj)
+                            else
+                                inMySector = (proj > minProj and proj <= maxProj)
+                            end
+                            if inMySector then
+                                local score = isFirstCoin and math.abs(proj - firstCoinTargetProj) or myDistSq
 
-                                        break
-                                    end
+                                if score < bestOwnScore then
+                                    bestOwnScore = score
+                                    bestOwnCoin = coin
+                                end
+                            else
+                                otherCoinCount = otherCoinCount + 1
+
+                                if myDistSq < bestBorrowDistSq and CanBorrowOtherSectorCoin(cx, cy, cz, myDistSq, activeTwinCount) then
+                                    bestBorrowDistSq = myDistSq
+                                    bestBorrowCoin = coin
                                 end
                             end
-                        end
-                        if isHardClaimedByTwin then
-                            if myDist < claimedFallbackDist then
-                                claimedFallbackDist = myDist
-                                claimedFallbackCoin = coin
-                            end
+                        else
+                            local closerThanTwins = true
 
-                            continue
-                        end
-                        if myDist < fallbackDist then
-                            fallbackDist = myDist
-                            fallbackCoin = coin
-                        end
-                        if isFirstCoin and hasActiveTwins and not isOverallLeader then
-                            local minTwinAnchorDist = math.huge
+                            for i = 1, activeTwinCount do
+                                local tdx = cx - activeTwinPosX[i]
+                                local tdy = cy - activeTwinPosY[i]
+                                local tdz = cz - activeTwinPosZ[i]
+                                local twinDistSq = tdx * tdx + tdy * tdy + tdz * tdz
 
-                            for _, twin in ipairs(activeTwins)do
-                                local d = (coinPos - twin.anchorPos).Magnitude
-
-                                if d < minTwinAnchorDist then
-                                    minTwinAnchorDist = d
-                                end
-                            end
-
-                            local startScore = minTwinAnchorDist - (myDist * 0.2)
-
-                            if startScore > bestScore then
-                                bestScore = startScore
-                                bestCoin = coin
-                            end
-
-                            continue
-                        end
-
-                        local isTwinZone = false
-
-                        if hasActiveTwins then
-                            for _, twin in ipairs(activeTwins)do
-                                if twin.claimedTarget and (coinPos - twin.claimedTarget).Magnitude < 14 then
-                                    isTwinZone = true
+                                if myDistSq > twinDistSq or (myDistSq == twinDistSq and mySlot ~= 1) then
+                                    closerThanTwins = false
 
                                     break
                                 end
-                                if twin.nextTarget and (coinPos - twin.nextTarget).Magnitude < 10 then
-                                    isTwinZone = true
-
-                                    break
-                                end
-
-                                local botsDist = (myPos - twin.pos).Magnitude
-                                local minSafeDist = (botsDist < 25) and 4 or 12
-
-                                if myDist > minSafeDist then
-                                    local twinDist = (coinPos - twin.pos).Magnitude
-                                    local predDist = twin.predPos and (coinPos - twin.predPos).Magnitude or math.huge
-
-                                    if (twinDist < avoidRadius) or (predDist < 18) or (twinDist < myDist) or (twinDist == myDist and not twin.isMeLeaderOverTwin) then
-                                        isTwinZone = true
-
-                                        break
-                                    end
-                                end
                             end
-                        end
-                        if not isTwinZone then
-                            if myDist < bestScore then
-                                if bestCoin then
-                                    secondBestDist = bestScore
-                                    secondBestPos = (bestCoin::BasePart).Position
-                                end
 
-                                bestScore = myDist
-                                bestCoin = coin
-                            elseif myDist < secondBestDist then
-                                secondBestDist = myDist
-                                secondBestPos = coinPos
+                            if closerThanTwins then
+                                if myDistSq < bestOwnScore then
+                                    bestOwnScore = myDistSq
+                                    bestOwnCoin = coin
+                                end
+                            else
+                                otherCoinCount = otherCoinCount + 1
+
+                                if myDistSq < bestBorrowDistSq and CanBorrowOtherSectorCoin(cx, cy, cz, myDistSq, activeTwinCount) then
+                                    bestBorrowDistSq = myDistSq
+                                    bestBorrowCoin = coin
+                                end
                             end
                         end
                     else
@@ -5788,16 +5783,21 @@ do
                     end
                 end
 
-                local chosen = bestCoin or fallbackCoin or claimedFallbackCoin
+                if bestOwnCoin then
+                    return bestOwnCoin, false
+                elseif otherCoinCount >= 2 and bestBorrowCoin then
+                    return bestBorrowCoin, true
+                end
 
-                return chosen, secondBestPos
+                return nil, false
             end
 
             local function moveToPositionPhysically(
                 targetPosition: Vector3,
                 targetCoin: Instance,
                 bv: BodyVelocity,
-                bg: BodyGyro
+                bg: BodyGyro,
+                isBorrowed: boolean?
             ): (boolean,boolean)
                 local char = rt:Character()
 
@@ -5856,21 +5856,21 @@ do
                     local currentPos = hrp.Position
                     local distance = (finalPosition - currentPos).Magnitude
 
-                    if distance > 5 and (now - lastHijackCheck) >= 0.15 then
+                    if isBorrowed and distance > 12 and (now - lastHijackCheck) >= 0.2 then
                         lastHijackCheck = now
 
-                        local activeTwins = GetActiveTwinsInfo()
+                        for _, plr in ipairs(Players:GetPlayers())do
+                            if plr ~= LocalPlayer and Network.IsTwinPlayer(plr, plr.Name) and Network.IsPlayerActuallyAlive(plr) then
+                                local tChar = plr.Character
+                                local tHrp = tChar and (tChar.PrimaryPart or tChar:FindFirstChild('HumanoidRootPart') or tChar:FindFirstChildWhichIsA('BasePart'))
 
-                        for _, twin in ipairs(activeTwins)do
-                            local twinDistToTarget = (targetPosition - twin.pos).Magnitude
-                            local twinClaimedThis = (twin.claimedTarget ~= nil and (targetPosition - twin.claimedTarget).Magnitude < 4.5)
+                                if tHrp and tHrp:IsA('BasePart') and (targetPosition - tHrp.Position).Magnitude < 8.5 then
+                                    if cRemoved then
+                                        cRemoved:Disconnect()
+                                    end
 
-                            if (twinDistToTarget < 6.5 and distance > 12) or (twinClaimedThis and (twinDistToTarget + 2 < distance or (math.abs(twinDistToTarget - distance) <= 2 and not twin.isMeLeaderOverTwin))) then
-                                if cRemoved then
-                                    cRemoved:Disconnect()
+                                    return false, true
                                 end
-
-                                return false, true
                             end
                         end
                     end
@@ -5978,12 +5978,10 @@ do
 
                     hrp = char.PrimaryPart
 
-                    local targetCoin, nextCoinPos = AutoFarm.GetNearestCoin(isFirstCoin)
+                    local targetCoin, isBorrowed = AutoFarm.GetNearestCoin(isFirstCoin)
 
                     if targetCoin then
                         local targetBasePart = targetCoin::BasePart
-
-                        PublishTwinSync(true, targetBasePart.Position, nextCoinPos)
 
                         if isFirstCoin then
                             isFirstCoin = false
@@ -6021,7 +6019,7 @@ do
                         State.UpdateStatus('\u{424}\u{430}\u{440}\u{43c}: \u{41b}\u{435}\u{447}\u{443} \u{43a} \u{43c}\u{43e}\u{43d}\u{435}\u{442}\u{435}', Color3.fromRGB(150, 255, 150))
                         markCoinAsPending(targetCoin)
 
-                        local pickedUp, wasHijacked = moveToPositionPhysically(targetBasePart.Position, targetCoin, bv, bg)
+                        local pickedUp, wasHijacked = moveToPositionPhysically(targetBasePart.Position, targetCoin, bv, bg, isBorrowed)
 
                         if not SETTINGS.AutoFarmEnabled or State.IsTerminated then
                             break
@@ -6048,8 +6046,6 @@ do
                             end
                         end
                     else
-                        PublishTwinSync(false, nil, nil)
-
                         if not rt.coinContainer then
                             local currentMap = MapTracker.Map()
 
@@ -6074,8 +6070,6 @@ do
                     end
                 end
 
-                PublishTwinSync(false, nil, nil)
-
                 if bv and bv.Parent then
                     bv:Destroy()
                 end
@@ -6091,6 +6085,48 @@ do
                 end
 
                 AutoFarm.AutoFarmCleanUp()
+            end
+            local function parkAtDoneAltitude(
+                char: Model,
+                hrp: BasePart,
+                hum: Humanoid
+            )
+                State.safeNoclipUntil = os.clock() + 2
+
+                if #rt.cachedBodyParts == 0 then
+                    State.UpdateBodyPartsCache()
+                end
+
+                for _, part in ipairs(rt.cachedBodyParts)do
+                    if part and part.Parent and part.CanCollide then
+                        part.CanCollide = false
+                    end
+                end
+
+                local doneY = MapTracker.GetDoneParkY()
+                local curPos = hrp.Position
+                local parkPos = Vector3.new(curPos.X, doneY, curPos.Z)
+
+                hum.PlatformStand = true
+
+                local hoverV = (hrp:FindFirstChild('FarmVelocity') or Instance.new('BodyVelocity'))::BodyVelocity
+
+                hoverV.Name = 'FarmVelocity'
+                hoverV.Velocity = Vector3.zero
+                hoverV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+                hoverV.Parent = hrp
+
+                local hoverG = (hrp:FindFirstChild('FarmGyro') or Instance.new('BodyGyro'))::BodyGyro
+
+                hoverG.Name = 'FarmGyro'
+                hoverG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+                hoverG.CFrame = CFrame.new(parkPos)
+                hoverG.P = 3000
+                hoverG.Parent = hrp
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+
+                char:PivotTo(CFrame.new(parkPos))
             end
             local function ActionState()
                 if (SETTINGS.RoundMode == 'Assassin' or SETTINGS.RoundMode == 'Clear') and SETTINGS.AutoFarmEnabled and not State.IsTerminated and Network.RoundInProgress() and Network.CheckIfPlayerWasInARound() then
@@ -6108,33 +6144,36 @@ do
                     return
                 end
 
-                local function maintainHoverUntilRoundEnd()
+                local function maintainHoverUntilRoundEnd(parkAtDone: boolean?)
                     local char = rt:Character()
                     local hrp = char and (char.PrimaryPart or char:FindFirstChild('HumanoidRootPart')::BasePart?)
                     local hum = char and char:FindFirstChildOfClass('Humanoid')
 
-                    if not hrp or not hum then
+                    if not char or not hrp or not hum then
                         return
                     end
+                    if parkAtDone then
+                        parkAtDoneAltitude(char, hrp, hum)
+                    else
+                        hum.PlatformStand = true
 
-                    hum.PlatformStand = true
+                        local hoverV = (hrp:FindFirstChild('FarmVelocity') or Instance.new('BodyVelocity'))::BodyVelocity
 
-                    local hoverV = hrp:FindFirstChild('FarmVelocity') or Instance.new('BodyVelocity')
+                        hoverV.Name = 'FarmVelocity'
+                        hoverV.Velocity = Vector3.zero
+                        hoverV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+                        hoverV.Parent = hrp
 
-                    hoverV.Name = 'FarmVelocity'
-                    hoverV.Velocity = Vector3.zero
-                    hoverV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
-                    hoverV.Parent = hrp
+                        local hoverG = (hrp:FindFirstChild('FarmGyro') or Instance.new('BodyGyro'))::BodyGyro
 
-                    local hoverG = hrp:FindFirstChild('FarmGyro') or Instance.new('BodyGyro')
-
-                    hoverG.Name = 'FarmGyro'
-                    hoverG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
-                    hoverG.CFrame = hrp.CFrame
-                    hoverG.P = 3000
-                    hoverG.Parent = hrp
-                    hrp.AssemblyLinearVelocity = Vector3.zero
-                    hrp.AssemblyAngularVelocity = Vector3.zero
+                        hoverG.Name = 'FarmGyro'
+                        hoverG.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+                        hoverG.CFrame = hrp.CFrame
+                        hoverG.P = 3000
+                        hoverG.Parent = hrp
+                        hrp.AssemblyLinearVelocity = Vector3.zero
+                        hrp.AssemblyAngularVelocity = Vector3.zero
+                    end
 
                     while not State.IsTerminated and Network.RoundInProgress() and SETTINGS.AutoFarmEnabled and hum.Health > 0 do
                         hum.PlatformStand = true
@@ -6144,11 +6183,16 @@ do
                         task.wait(0.2)
                     end
 
-                    if hoverV and hoverV.Parent then
-                        hoverV:Destroy()
+                    local vObj = hrp:FindFirstChild('FarmVelocity')
+
+                    if vObj then
+                        vObj:Destroy()
                     end
-                    if hoverG and hoverG.Parent then
-                        hoverG:Destroy()
+
+                    local gObj = hrp:FindFirstChild('FarmGyro')
+
+                    if gObj then
+                        gObj:Destroy()
                     end
                     if hum then
                         hum.PlatformStand = false
@@ -6156,6 +6200,8 @@ do
                 end
 
                 if State.BagIsFull then
+                    local parkForTwins = SETTINGS.TwinAvoidEnabled and Network.HasTwinsConfigured()
+
                     if SETTINGS.BagFullMode == 'KillAll' then
                         Combat.KillFinalTarget()
                         task.wait(0.3)
@@ -6163,7 +6209,7 @@ do
                         State.BagIsFull = false
 
                         State.ChangeState(State.WaitingForRoundEnd)
-                        maintainHoverUntilRoundEnd()
+                        maintainHoverUntilRoundEnd(parkForTwins)
                     elseif SETTINGS.BagFullMode == 'AFK' then
                         Combat.UnequipKnife()
                         State.UpdateStatus('\u{421}\u{443}\u{43c}\u{43a}\u{430} \u{43f}\u{43e}\u{43b}\u{43d}\u{430}: AFK (\u{43f}\u{430}\u{440}\u{435}\u{43d}\u{438}\u{435} \u{43d}\u{430} \u{43c}\u{435}\u{441}\u{442}\u{435})', Color3.fromRGB(170, 130, 255))
@@ -6171,8 +6217,75 @@ do
                         State.BagIsFull = false
 
                         State.ChangeState(State.WaitingForRoundEnd)
-                        maintainHoverUntilRoundEnd()
+                        maintainHoverUntilRoundEnd(parkForTwins)
                     else
+                        local isTwinMode = (SETTINGS.GameMode == 'Twin' and parkForTwins)
+
+                        if isTwinMode then
+                            local char = rt:Character()
+                            local hrp = char and (char.PrimaryPart or char:FindFirstChild('HumanoidRootPart')::BasePart?)
+                            local hum = char and char:FindFirstChildOfClass('Humanoid')
+
+                            if char and hrp and hum and hum.Health > 0 then
+                                local _, _, activeTwinCount = RefreshTwinState(true)
+                                local myRole = Network.PlayerRolesCache[LocalPlayer.Name]
+                                local mustWait = (activeTwinCount > 0) and (CountAliveEnemies() == 0 or myRole == 'Murderer')
+
+                                if mustWait then
+                                    parkAtDoneAltitude(char, hrp, hum)
+                                    State.UpdateStatus('\u{421}\u{443}\u{43c}\u{43a}\u{430} \u{43f}\u{43e}\u{43b}\u{43d}\u{430}: \u{436}\u{434}\u{451}\u{43c} \u{442}\u{432}\u{438}\u{43d}\u{43a}\u{430} (\u{43c}\u{430}\u{44f}\u{43a} DONE)', Color3.fromRGB(130, 220, 255))
+
+                                    local waitStart = os.clock()
+
+                                    while not State.IsTerminated and SETTINGS.AutoFarmEnabled and State.CurrentState == State.Action and Network.RoundInProgress() and hum.Health > 0 and (os.clock() - waitStart < 50) do
+                                        task.wait(0.25)
+
+                                        hum.PlatformStand = true
+                                        hrp.AssemblyLinearVelocity = Vector3.zero
+                                        hrp.AssemblyAngularVelocity = Vector3.zero
+
+                                        local _, _, remActive, doneCount, isHighestDoneUserId = RefreshTwinState(true)
+
+                                        if remActive == 0 then
+                                            if doneCount > 0 and not isHighestDoneUserId then
+                                                task.wait(0.6)
+                                            elseif doneCount == 0 then
+                                                task.wait(0.5)
+                                            end
+
+                                            break
+                                        end
+                                    end
+
+                                    local vObj = hrp:FindFirstChild('FarmVelocity')
+
+                                    if vObj then
+                                        vObj:Destroy()
+                                    end
+
+                                    local gObj = hrp:FindFirstChild('FarmGyro')
+
+                                    if gObj then
+                                        gObj:Destroy()
+                                    end
+
+                                    hum.PlatformStand = false
+                                end
+                            end
+                        end
+                        if State.IsTerminated or not SETTINGS.AutoFarmEnabled then
+                            return
+                        end
+                        if State.CurrentState ~= State.Action or not Network.RoundInProgress() then
+                            State.BagIsFull = false
+
+                            if not Network.RoundInProgress() then
+                                State.ChangeState(State.WaitingForRound)
+                            end
+
+                            return
+                        end
+
                         State.UpdateStatus('\u{421}\u{443}\u{43c}\u{43a}\u{430} \u{43f}\u{43e}\u{43b}\u{43d}\u{430}: \u{421}\u{431}\u{440}\u{43e}\u{441} \u{43f}\u{435}\u{440}\u{441}\u{43e}\u{43d}\u{430}\u{436}\u{430}', Color3.fromRGB(200, 200, 200))
                         State.ChangeState(State.WaitingForRoundEnd)
 
@@ -6330,7 +6443,6 @@ do
                     State.DisconnectCharDescConn()
                     table.clear(rt.cachedBodyParts)
                     AutoFarm.AutoFarmCleanUp()
-                    Config.ClearTwinSyncCache()
                 end)
             end
 
